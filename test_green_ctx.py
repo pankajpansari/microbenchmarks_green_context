@@ -8,7 +8,7 @@ import pandas as pd
 _ = torch.empty(1, device='cuda:0')
 
 S = 2048 # sequence len
-D = 8192 # model embedding dim
+D = 4096 # model embedding dim
 N = 32 # number of heads (same for K,Q,V)
 H = D // N # head dimension
 F = 4 * D # FFN hidden dimension
@@ -39,6 +39,29 @@ def do_prefill(x):
   o_1 = Func.relu(o_1)
   output = torch.einsum('sf, fd -> sd', o_1, W_out)
   return output
+
+def do_batched_serial_prefill(x):
+  
+  # Iterate over samples in batch
+  # self-attention block
+  output = torch.zeros_like(x)
+
+  for i in range(x.shape[0]):
+    q_i = torch.einsum('sd, dnh -> snh', x[i], W_q)   
+
+    k_i = torch.einsum('sd, dnh -> snh', x[i], W_k)   
+    v_i = torch.einsum('sd, dnh -> snh', x[i], W_v)   
+    
+    v_attention_i = flashinfer.single_prefill_with_kv_cache(q_i, k_i, v_i, causal = True)
+
+    o_i = torch.einsum('snh, nhd -> sd', v_attention_i, W_o)
+
+    # ffn block
+    o_1_i = torch.einsum('sd, df -> sf', o_i, W_in)
+    o_1_i = Func.relu(o_1_i)
+    output[i] = torch.einsum('sf, fd -> sd', o_1_i, W_out)
+  return output
+
 
 def do_batched_decode(x, paged_kv, decode_wrapper):
   
@@ -152,10 +175,10 @@ def no_contention_greenctx_decodes(decode_wrapper, B):
   print(f"B = {B} no contention green context benchmark done")
 
 
-def no_contention_greenctx_prefill():
+def no_contention_greenctx_prefill(B_prefill):
   # Setting: Prefill using one green context; remaining SMs outside context idle 
 
-  activation = torch.randn((S, D), dtype = torch.float16, device = "cuda")
+  activation = torch.randn((B_prefill, S, D), dtype = torch.float16, device = "cuda")
 
   device_props = torch.cuda.get_device_properties(0)
   num_sms = device_props.multi_processor_count
@@ -173,7 +196,7 @@ def no_contention_greenctx_prefill():
   # Warmup: launch some prefill kernels
   with torch.inference_mode():
     for _ in range(NUM_WARMUPS):
-      out = do_prefill(activation)
+      out = do_batched_serial_prefill(activation)
 
   start = torch.cuda.Event(enable_timing = True)
   end = torch.cuda.Event(enable_timing = True)
@@ -185,7 +208,7 @@ def no_contention_greenctx_prefill():
   # Actual prefill runs for timing
   with torch.inference_mode():
     for _ in range(NUM_ITERS):
-      out = do_prefill(activation)
+      out = do_batched_serial_prefill(activation)
 
   end.record()
 
@@ -209,7 +232,7 @@ def no_contention_greenctx_prefill():
       # Warmup: launch some prefill kernel
       with torch.inference_mode():
         for _ in range(NUM_WARMUPS):
-          out = do_prefill(activation)
+          out = do_batched_serial_prefill(activation)
 
       start = torch.cuda.Event(enable_timing = True)
       end = torch.cuda.Event(enable_timing = True)
@@ -221,7 +244,7 @@ def no_contention_greenctx_prefill():
       # Actual prefill runs for timing
       with torch.inference_mode():
         for _ in range(NUM_ITERS):
-          out = do_prefill(activation)
+          out = do_batched_serial_prefill(activation)
 
       end.record()
 
@@ -261,13 +284,11 @@ def run_decode_only_exp():
 
 def run_prefill_only_exp():
 
-  all_batch_results = []
+  B_prefill = 8
+  no_contention_results = no_contention_greenctx_prefill(B_prefill)
 
-  no_contention_results = no_contention_greenctx_prefill()
-  all_batch_results.append(no_contention_results)
-
-  df = pd.DataFrame(all_batch_results)
-  csv_filename = "greenctx_no_contention_prefill_tp" + "_d" + str(D) + ".csv"
+  df = pd.DataFrame(no_contention_results)
+  csv_filename = "greenctx_no_contention_batched_serial_prefill_tp" + "_d" + str(D) + ".csv"
   df.to_csv(csv_filename, index = False)
 
 def main():
