@@ -8,7 +8,7 @@ import pandas as pd
 _ = torch.empty(1, device='cuda:0')
 
 S = 2048 # sequence len
-D = 8192 # model embedding dim
+D = 4096 # model embedding dim
 N = 32 # number of heads (same for K,Q,V)
 H = D // N # head dimension
 F = 4 * D # FFN hidden dimension
@@ -62,7 +62,7 @@ def do_batched_decode(x, paged_kv, decode_wrapper):
   return output
 
 def no_contention_greenctx_decodes(decode_wrapper, B):
-  # Baseline 2: Decodes using one green context; remaining SMs outside context idle 
+  # Setting: Decodes using one green context; remaining SMs outside context idle 
 
   # Set up KV caches on GPU HBM
   k_cache = torch.randn((B, S, N, H), dtype = torch.float16, device = "cuda")
@@ -152,7 +152,90 @@ def no_contention_greenctx_decodes(decode_wrapper, B):
   print(f"B = {B} no contention green context benchmark done")
 
 
-def main():
+def no_contention_greenctx_prefill(B):
+  # Setting: Prefill using one green context; remaining SMs outside context idle 
+
+  activation = torch.randn((S, D), dtype = torch.float16, device = "cuda")
+
+  device_props = torch.cuda.get_device_properties(0)
+  num_sms = device_props.multi_processor_count
+
+  dev = torch.device("cuda:0")
+  all_streams = []
+  all_resources = []
+  granularity = 8
+
+  NUM_WARMUPS = 10
+  NUM_ITERS = 100 
+  no_contention_results = []
+
+  # Without any partition - prefill has all SMs
+  # Warmup: launch some prefill kernels
+  with torch.inference_mode():
+    for _ in range(NUM_WARMUPS):
+      out = do_prefill(activation)
+
+  start = torch.cuda.Event(enable_timing = True)
+  end = torch.cuda.Event(enable_timing = True)
+
+  torch.cuda.synchronize()
+
+  start.record()
+
+  # Actual prefill runs for timing
+  with torch.inference_mode():
+    for _ in range(NUM_ITERS):
+      out = do_prefill(activation)
+
+  end.record()
+
+  torch.cuda.synchronize()
+
+  prefill_tp = int((S * NUM_ITERS * 1000)/ start.elapsed_time(end)) # Num of tokens processed/time (toks/s)
+
+  print(f"Without contention (Batch Size: {B}, Active SMs: {num_sms}) througput (toks/s): {prefill_tp}")
+
+  no_contention_results.append({"Batch": B, "Active_SMs": num_sms, "Throughput_toks_s": prefill_tp})
+
+  # Sweep over partition configs. Create green context + associated stream for each 
+  for i in range(1, num_sms // granularity):
+
+    active_sms = num_sms - i*granularity
+    streams, resources = split_device_green_ctx_by_sm_count(dev, [active_sms])
+
+    target_stream = streams[0]
+    with torch.cuda.stream(target_stream):
+
+      # Warmup: launch some prefill kernel
+      with torch.inference_mode():
+        for _ in range(NUM_WARMUPS):
+          out = do_prefill(activation)
+
+      start = torch.cuda.Event(enable_timing = True)
+      end = torch.cuda.Event(enable_timing = True)
+
+      target_stream.synchronize()
+
+      start.record()
+
+      # Actual prefill runs for timing
+      with torch.inference_mode():
+        for _ in range(NUM_ITERS):
+          out = do_prefill(activation)
+
+      end.record()
+
+      target_stream.synchronize()
+
+      prefill_tp = int((S * NUM_ITERS * 1000)/ start.elapsed_time(end)) # Num of tokens processed/time (toks/s)
+
+      print(f"Without contention (Batch Size: {B}, Active SMs: {num_sms}) througput (toks/s): {prefill_tp}")
+
+      no_contention_results.append({"Batch": B, "Active_SMs": num_sms, "Throughput_toks_s": prefill_tp})
+
+  return no_contention_results
+
+def run_decode_only_exp():
   # Set up paging config of KV cache
   workspace = torch.zeros(128 * 1024 * 1024, dtype = torch.uint8, device = "cuda")
 
@@ -176,6 +259,21 @@ def main():
   csv_filename = "greenctx_no_contention_decode_itl" + "_d" + str(D) + ".csv"
   df.to_csv(csv_filename, index = False)
 
+def run_prefill_only_exp():
+
+  all_batch_results = []
+  for B in [32, 64, 128, 256, 512]: # batch size
+
+    no_contention_results = no_contention_greenctx_prefill(B)
+    all_batch_results.append(no_contention_results)
+
+  df = pd.DataFrame(all_batch_results)
+  csv_filename = "greenctx_no_contention_prefill_tp" + "_d" + str(D) + ".csv"
+  df.to_csv(csv_filename, index = False)
+
+def main():
+#  run_decode_only_exp()
+  run_prefill_only_exp()
 
 if __name__ == "__main__":
   main()
