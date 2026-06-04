@@ -128,13 +128,10 @@ def no_contention_greenctx_decodes():
 
   # Sweep over partition configs. Create green context + associated stream for each 
   for i in range(1, num_sms // granularity):
-    streams_i, resources_i = split_device_green_ctx(dev, num_sms - i*granularity, i*granularity)
-    assert(resources_i[2].sm.smCount == 0) # ensure that there are two discrete partitions only
-    all_streams.append(streams_i)
-    all_resources.append(resources_i)
 
+    streams, resources = split_device_green_ctx(dev, num_sms - i*granularity, i*granularity)
+    assert(resources[2].sm.smCount == 0) # ensure that there are two discrete partitions only
 
-  for streams, resources in zip(all_streams, all_resources):
     target_stream = streams[0]
     with torch.cuda.stream(target_stream):
 
