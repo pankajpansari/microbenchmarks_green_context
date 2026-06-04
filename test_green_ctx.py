@@ -1,7 +1,6 @@
 import torch
 import torch.nn.functional as Func
 import flashinfer
-from torch.nn.attention import SDPBackend, sdpa_kernel
 from flashinfer.green_ctx import split_device_green_ctx_by_sm_count
 import pandas as pd
 
@@ -214,7 +213,7 @@ def no_contention_greenctx_prefill(B_prefill):
 
   torch.cuda.synchronize()
 
-  prefill_tp = int((S * NUM_ITERS * 1000)/ start.elapsed_time(end)) # Num of tokens processed/time (toks/s)
+  prefill_tp = int((B_prefill * S * NUM_ITERS * 1000)/ start.elapsed_time(end)) # Num of tokens processed/time (toks/s)
 
   print(f"Without contention (Active SMs: {num_sms}) througput (toks/s): {prefill_tp}")
 
@@ -250,7 +249,7 @@ def no_contention_greenctx_prefill(B_prefill):
 
       target_stream.synchronize()
 
-      prefill_tp = int((S * NUM_ITERS * 1000)/ start.elapsed_time(end)) # Num of tokens processed/time (toks/s)
+      prefill_tp = int((B_prefill * S * NUM_ITERS * 1000)/ start.elapsed_time(end)) # Num of tokens processed/time (toks/s)
 
       print(f"Without contention (Active SMs: {active_sms}) througput (toks/s): {prefill_tp}")
 
