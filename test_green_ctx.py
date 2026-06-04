@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as Func
 import flashinfer
 from torch.nn.attention import SDPBackend, sdpa_kernel
-from flashinfer.green_ctx import split_device_green_ctx
+from flashinfer.green_ctx import split_device_green_ctx_by_sm_count
 import pandas as pd
 
 _ = torch.empty(1, device='cuda:0')
@@ -129,8 +129,7 @@ def no_contention_greenctx_decodes():
   # Sweep over partition configs. Create green context + associated stream for each 
   for i in range(1, num_sms // granularity):
 
-    streams, resources = split_device_green_ctx(dev, num_sms - i*granularity, i*granularity)
-    assert(resources[2].sm.smCount == 0) # ensure that there are two discrete partitions only
+    streams, resources = split_device_green_ctx_by_sm_count(dev, [num_sms - i*granularity])
 
     target_stream = streams[0]
     with torch.cuda.stream(target_stream):
