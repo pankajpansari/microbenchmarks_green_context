@@ -8,7 +8,7 @@ import pandas as pd
 _ = torch.empty(1, device='cuda:0')
 
 S = 2048 # sequence len
-D = 4096 # model embedding dim
+D = 8192 # model embedding dim
 N = 32 # number of heads (same for K,Q,V)
 H = D // N # head dimension
 F = 4 * D # FFN hidden dimension
@@ -40,7 +40,7 @@ def do_prefill(x):
   output = torch.einsum('sf, fd -> sd', o_1, W_out)
   return output
 
-def do_batched_decode(x, paged_kv):
+def do_batched_decode(x, paged_kv, decode_wrapper):
   
   # context len always at S; cache does not grow
 
@@ -87,7 +87,7 @@ def no_contention_greenctx_decodes(decode_wrapper, B):
   # Warmup: launch some decode kernel
   with torch.inference_mode():
     for _ in range(NUM_WARMUPS):
-      out = do_batched_decode(activation, paged_kv)
+      out = do_batched_decode(activation, paged_kv, decode_wrapper)
 
   start = torch.cuda.Event(enable_timing = True)
   end = torch.cuda.Event(enable_timing = True)
@@ -99,7 +99,7 @@ def no_contention_greenctx_decodes(decode_wrapper, B):
   # Actual decode runs for timing
   with torch.inference_mode():
     for _ in range(NUM_ITERS):
-      out = do_batched_decode(activation, paged_kv)
+      out = do_batched_decode(activation, paged_kv, decode_wrapper)
 
   end.record()
 
@@ -115,7 +115,8 @@ def no_contention_greenctx_decodes(decode_wrapper, B):
   # Sweep over partition configs. Create green context + associated stream for each 
   for i in range(1, num_sms // granularity):
 
-    streams, resources = split_device_green_ctx_by_sm_count(dev, [num_sms - i*granularity])
+    active_sms = num_sms - i*granularity
+    streams, resources = split_device_green_ctx_by_sm_count(dev, [active_sms])
 
     target_stream = streams[0]
     with torch.cuda.stream(target_stream):
@@ -123,7 +124,7 @@ def no_contention_greenctx_decodes(decode_wrapper, B):
       # Warmup: launch some decode kernel
       with torch.inference_mode():
         for _ in range(NUM_WARMUPS):
-          out = do_batched_decode(activation, paged_kv)
+          out = do_batched_decode(activation, paged_kv, decode_wrapper)
 
       start = torch.cuda.Event(enable_timing = True)
       end = torch.cuda.Event(enable_timing = True)
@@ -135,7 +136,7 @@ def no_contention_greenctx_decodes(decode_wrapper, B):
       # Actual decode runs for timing
       with torch.inference_mode():
         for _ in range(NUM_ITERS):
-          out = do_batched_decode(activation, paged_kv)
+          out = do_batched_decode(activation, paged_kv, decode_wrapper)
 
       end.record()
 
@@ -143,9 +144,9 @@ def no_contention_greenctx_decodes(decode_wrapper, B):
 
       itl = start.elapsed_time(end) / NUM_ITERS
 
-      print(f"Without contention (Batch Size: {B}, Active SMs: {num_sms}) inter_token_latency (ms): {itl:.3f}")
+      print(f"Without contention (Batch Size: {B}, Active SMs: {active_sms}) inter_token_latency (ms): {itl:.3f}")
 
-      no_contention_results.append({"Batch": B, "Active_SMs": num_sms, "Elapsed_time_ms": round(itl, 3)})
+      no_contention_results.append({"Batch": B, "Active_SMs": active_sms, "Elapsed_time_ms": round(itl, 3)})
 
   return no_contention_results
   print(f"B = {B} no contention green context benchmark done")
@@ -169,7 +170,7 @@ def main():
       num_qo_heads = N, num_kv_heads = N, head_dim = H, page_size = S)
 
     no_contention_results = no_contention_greenctx_decodes(decode_wrapper, B)
-    all_batch_results.append(no_conention_results)
+    all_batch_results.append(no_contention_results)
 
   df = pd.DataFrame(all_batch_results)
   csv_filename = "greenctx_no_contention_decode_itl" + "_d" + str(D) + ".csv"
