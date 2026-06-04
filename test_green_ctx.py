@@ -7,8 +7,7 @@ import pandas as pd
 
 _ = torch.empty(1, device='cuda:0')
 
-B = 128 # batch size
-S = 512 # sequence len
+S = 2048 # sequence len
 D = 4096 # model embedding dim
 N = 32 # number of heads (same for K,Q,V)
 H = D // N # head dimension
@@ -41,19 +40,6 @@ def do_prefill(x):
   output = torch.einsum('sf, fd -> sd', o_1, W_out)
   return output
 
-# Set up paging config of KV cache
-workspace = torch.empty(128 * 1024 * 1024, dtype = torch.uint8, device = "cuda")
-decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(workspace, "NHD")
-
-page_size = S
-num_pages = B
-kv_indptr = torch.arange(0, B + 1, dtype = torch.int32, device = "cuda")
-kv_indices = torch.arange(0, B, dtype = torch.int32, device = "cuda")
-kv_last_page_len = torch.full((B, ), S, dtype = torch.int32, device = "cuda")
-
-decode_wrapper.plan(kv_indptr, kv_indices, kv_last_page_len,
-  num_qo_heads = N, num_kv_heads = N, head_dim = H, page_size = S)
-
 def do_batched_decode(x, paged_kv):
   
   # context len always at S; cache does not grow
@@ -75,7 +61,7 @@ def do_batched_decode(x, paged_kv):
   output = torch.einsum('bsf, fd -> bsd', o_1, W_out) # s = 1 
   return output
 
-def no_contention_greenctx_decodes():
+def no_contention_greenctx_decodes(decode_wrapper, B):
   # Baseline 2: Decodes using one green context; remaining SMs outside context idle 
 
   # Set up KV caches on GPU HBM
@@ -121,9 +107,9 @@ def no_contention_greenctx_decodes():
 
   itl = start.elapsed_time(end) / NUM_ITERS
 
-  print(f"Without contention (Active SMs: {num_sms}) inter_token_latency (ms): {itl:.3f}")
+  print(f"Without contention (Batch Size: {B}, Active SMs: {num_sms}) inter_token_latency (ms): {itl:.3f}")
 
-  no_contention_results.append({"Active_SMs": num_sms, "Elapsed_time_ms": round(itl, 3)})
+  no_contention_results.append({"Batch": B, "Active_SMs": num_sms, "Elapsed_time_ms": round(itl, 3)})
 
 
   # Sweep over partition configs. Create green context + associated stream for each 
@@ -157,20 +143,38 @@ def no_contention_greenctx_decodes():
 
       itl = start.elapsed_time(end) / NUM_ITERS
 
-      print(f"Without contention (Active SMs: {resources[0].sm.smCount}) inter_token_latency (ms): {itl:.3f}")
+      print(f"Without contention (Batch Size: {B}, Active SMs: {num_sms}) inter_token_latency (ms): {itl:.3f}")
 
-      no_contention_results.append({"Active_SMs": resources[0].sm.smCount, "Elapsed_time_ms": round(itl, 3)})
+      no_contention_results.append({"Batch": B, "Active_SMs": num_sms, "Elapsed_time_ms": round(itl, 3)})
 
-  df = pd.DataFrame(no_contention_results)
-
-  csv_filename = "greenctx_no_contention_decode_itl.csv"
-  df.to_csv(csv_filename, index = False)
-
-  print("No contention bechmark done")
+  return no_contention_results
+  print(f"B = {B} no contention green context benchmark done")
 
 
 def main():
-  no_contention_greenctx_decodes()
+  # Set up paging config of KV cache
+  workspace = torch.zeros(128 * 1024 * 1024, dtype = torch.uint8, device = "cuda")
+
+  all_batch_results = []
+  for B in [32, 64, 128, 256, 512]: # batch size
+    decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(workspace, "NHD")
+
+    page_size = S
+    num_pages = B
+    kv_indptr = torch.arange(0, B + 1, dtype = torch.int32, device = "cuda")
+    kv_indices = torch.arange(0, B, dtype = torch.int32, device = "cuda")
+    kv_last_page_len = torch.full((B, ), S, dtype = torch.int32, device = "cuda")
+
+    decode_wrapper.plan(kv_indptr, kv_indices, kv_last_page_len,
+      num_qo_heads = N, num_kv_heads = N, head_dim = H, page_size = S)
+
+    no_contention_results = no_contention_greenctx_decodes(decode_wrapper, B)
+    all_batch_results.append(no_conention_results)
+
+  df = pd.DataFrame(all_batch_results)
+  csv_filename = "greenctx_no_contention_decode_itl" + "_d" + str(D) + ".csv"
+  df.to_csv(csv_filename, index = False)
+
 
 if __name__ == "__main__":
   main()
