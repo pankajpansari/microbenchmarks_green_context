@@ -39,7 +39,7 @@ def do_prefill(x):
   output = torch.einsum('sf, fd -> sd', o_1, W_out)
   return output
 
-def do_batched_serial_prefill(x):
+def do_serial_prefill(x):
   
   # Iterate over samples in batch
   # self-attention block
@@ -59,6 +59,25 @@ def do_batched_serial_prefill(x):
     o_1_i = torch.einsum('sd, df -> sf', o_i, W_in)
     o_1_i = Func.relu(o_1_i)
     output[i] = torch.einsum('sf, fd -> sd', o_1_i, W_out)
+  return output
+
+def do_batched_prefill(x, prefill_wrapper):
+  
+  #x is a batch of prefill token embedding 
+  q = torch.einsum('bsd, dnh -> bsnh', x, W_q).squeeze(1)   
+
+  #we don't append these to kv cache
+  k = torch.einsum('bsd, dnh -> bsnh', x, W_k).squeeze(1)   
+  v = torch.einsum('bsd, dnh -> bsnh', x, W_v).squeeze(1)   
+
+  v_attention = prefill_wrapper.run(q, paged_kv).unsqueeze(1)
+
+  o = torch.einsum('bsnh, nhd -> bsd', v_attention, W_o) 
+
+  #ffn block
+  o_1 = torch.einsum('bsd, df -> bsf', o, W_in) 
+  o_1 = Func.relu(o_1)
+  output = torch.einsum('bsf, fd -> bsd', o_1, W_out) 
   return output
 
 
@@ -289,7 +308,7 @@ def no_contention_greenctx_prefill(B_prefill):
   # Warmup: launch some prefill kernels
   with torch.inference_mode():
     for _ in range(NUM_WARMUPS):
-      out = do_batched_serial_prefill(activation)
+      out = do_serial_prefill(activation)
 
   start = torch.cuda.Event(enable_timing = True)
   end = torch.cuda.Event(enable_timing = True)
@@ -301,7 +320,7 @@ def no_contention_greenctx_prefill(B_prefill):
   # Actual prefill runs for timing
   with torch.inference_mode():
     for _ in range(NUM_ITERS):
-      out = do_batched_serial_prefill(activation)
+      out = do_serial_prefill(activation)
 
   end.record()
 
@@ -325,7 +344,7 @@ def no_contention_greenctx_prefill(B_prefill):
       # Warmup: launch some prefill kernel
       with torch.inference_mode():
         for _ in range(NUM_WARMUPS):
-          out = do_batched_serial_prefill(activation)
+          out = do_serial_prefill(activation)
 
       start = torch.cuda.Event(enable_timing = True)
       end = torch.cuda.Event(enable_timing = True)
@@ -337,7 +356,7 @@ def no_contention_greenctx_prefill(B_prefill):
       # Actual prefill runs for timing
       with torch.inference_mode():
         for _ in range(NUM_ITERS):
-          out = do_batched_serial_prefill(activation)
+          out = do_serial_prefill(activation)
 
       end.record()
 
@@ -393,7 +412,7 @@ def run_decode_contention_exp():
     decode_wrapper.plan(kv_indptr, kv_indices, kv_last_page_len,
       num_qo_heads = N, num_kv_heads = N, head_dim = H, page_size = S)
 
-    contention_decode_results = contention_greenctx_decodes(decode_wrapper, do_batched_serial_prefill, B_dec, B_prefill)
+    contention_decode_results = contention_greenctx_decodes(decode_wrapper, do_serial_prefill, B_dec, B_prefill)
     all_batch_results.append(contention_decode_results)
 
   df = pd.DataFrame(all_batch_results)
