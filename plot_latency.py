@@ -2,9 +2,10 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import ast
 import numpy as np
+import argparse
 
-def plot_decode_info():
-  df = pd.read_csv('greenctx_no_contention_decode_itl_d8192.csv')
+def plot_decode_info(csv_filename):
+  df = pd.read_csv(csv_filename)
 
   records = []
   for _, row in df.iterrows():
@@ -19,16 +20,17 @@ def plot_decode_info():
 
   for batch in batches:
     df_batch = df_flat[df_flat['Batch'] == batch]
-    ax.plot(df_batch['Active_SMs'], df_batch['Elapsed_time_ms'], marker = 'o', linestyle = '-', label = 'B: ' + str(batch))
+    ax.plot(df_batch['Active_SMs'], df_batch['ITL_ms'], marker = 'o', linestyle = '-', label = 'B: ' + str(batch))
 
   ax.set_xlabel('Num of SMs')
   ax.set_ylabel('Single layer decode time (ms)')
   ax.legend(title = 'Batch size')
-  ax.set_title('Decode in green context without contention')
-  plt.savefig('no-contention-decodes-green-ctx-all-batches-d8192-h100.png')
 
-def plot_prefill_info():
-  df = pd.read_csv('greenctx_no_contention_batched_serial_prefill_tp_d8192.csv')
+  png_filename = csv_filename.split('.')[0] + '.png'
+  plt.savefig(png_filename)
+
+def plot_prefill_info(csv_filename):
+  df = pd.read_csv(csv_filename)
 
 #  records = []
 #  for _, row in df.iterrows():
@@ -45,10 +47,15 @@ def plot_prefill_info():
   ax.set_xlabel('Num of SMs')
   ax.set_ylabel('Single layer prefill throughput (toks/s)')
   ax.set_title('Prefill in green context without contention')
-  plt.savefig('no-contention-batched-serial-prefill-green-ctx-d8192-h100.png', bbox_inches = 'tight')
+
+  png_filename = csv_filename.split('.')[0] + '.png'
+  plt.savefig(png_filename, bbox_inches = 'tight')
 
 def main():
-  plot_prefill_info()
+  parser = argparse.ArgumentParser()
+  parser.add_argument('filename')
+  args = parser.parse_args()
+  plot_decode_info(args.filename)
 
 if __name__ == "__main__":
   main() 
