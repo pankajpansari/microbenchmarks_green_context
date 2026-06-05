@@ -173,7 +173,7 @@ def no_contention_greenctx_decodes(decode_wrapper, B):
   return no_contention_results
   print(f"B = {B} no contention green context benchmark done")
 
-  def contention_green_ctx_decodes(decode_wrapper, prefill_fn, B_dec, B_prefill):
+def contention_greenctx_decodes(decode_wrapper, prefill_fn, B_dec, B_prefill):
   # Experiment: Profile decodes with serial prefill running in the other green context 
 
   # Set up KV caches on GPU HBM
@@ -214,7 +214,7 @@ def no_contention_greenctx_decodes(decode_wrapper, B):
       # Warmup: launch some decode kernel
       with torch.inference_mode():
         for _ in range(NUM_WARMUPS):
-          out = do_batched_decode(activation_decode, paged_kv)
+          out = do_batched_decode(activation_decode, paged_kv, decode_wrapper)
 
     with torch.cuda.stream(stream_prefill):
       # Warmup: launch some prefill kernel
@@ -236,7 +236,7 @@ def no_contention_greenctx_decodes(decode_wrapper, B):
     # decode kernels start executing from other stream
     with torch.cuda.stream(stream_prefill):
       with torch.inference_mode():
-        for _ in range(10*NUM_ITERS):
+        for _ in range(NUM_ITERS):
           out = prefill_fn(activation_prefill)
     torch.cuda.nvtx.range_pop()
 
@@ -246,7 +246,7 @@ def no_contention_greenctx_decodes(decode_wrapper, B):
     with torch.cuda.stream(stream_dec):
       with torch.inference_mode():
         for _ in range(NUM_ITERS):
-          out = do_batched_decode(activation_decode, paged_kv)
+          out = do_batched_decode(activation_decode, paged_kv, decode_wrapper)
     torch.cuda.nvtx.range_pop()
 
     end1.record(stream_dec)
@@ -262,9 +262,9 @@ def no_contention_greenctx_decodes(decode_wrapper, B):
     assert (elapsedTime2 > elapsedTime1) #green context running prefill should never be idle for this benchmark to work
     itl = elapsedTime1 / NUM_ITERS
 
-    print(f"(Batch Size: {B_d}, Active SMs: {active_sms}) inter_token_latency (ms): {itl:.3f} Decode total time (ms): {elapsedTime1:.1f} Prefill total time (ms): {elapsedTime2:.1f}")
+    print(f"(Batch Size: {B_dec}, Active SMs: {active_sms}) inter_token_latency (ms): {itl:.3f} Decode total time (ms): {elapsedTime1:.1f} Prefill total time (ms): {elapsedTime2:.1f}")
 
-    contention_decode_results.append({"Batch": B_d, "Active_SMs": active_sms, "ITL_ms": round(itl, 3)})
+    contention_decode_results.append({"Batch": B_dec, "Active_SMs": active_sms, "ITL_ms": round(itl, 3)})
 
   return contention_decode_results
 
@@ -382,7 +382,7 @@ def run_decode_contention_exp():
   B_prefill = 8
   all_batch_results = []
   for B_dec in [32, 64, 128, 256, 512]: # batch size
-    decode_wrapper = flashinfer.B_decatchDecodeWithPagedKVCacheWrapper(workspace, "NHD")
+    decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(workspace, "NHD")
 
     page_size = S
     num_pages = B_dec
