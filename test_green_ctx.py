@@ -70,7 +70,8 @@ def do_batched_prefill(x, prefill_wrapper):
   k = torch.einsum('bsd, dnh -> bsnh', x, W_k).squeeze(1)   
   v = torch.einsum('bsd, dnh -> bsnh', x, W_v).squeeze(1)   
 
-  v_attention = prefill_wrapper.run(q, paged_kv).unsqueeze(1)
+  v_attention = prefill_wrapper.run(q, k, v)
+  v_attention = einops.rearrange(v_attention, '(bs)nh -> bsnh', b = x.shape[0])
 
   o = torch.einsum('bsnh, nhd -> bsd', v_attention, W_o) 
 
@@ -192,7 +193,7 @@ def no_contention_greenctx_decodes(decode_wrapper, B):
   return no_contention_results
   print(f"B = {B} no contention green context benchmark done")
 
-def contention_greenctx_decodes(decode_wrapper, prefill_fn, B_dec, B_prefill):
+def contention_greenctx_decodes(prefill_fn, B_dec, B_prefill):
   # Experiment: Profile decodes with serial prefill running in the other green context 
 
   # Set up KV caches on GPU HBM
@@ -204,6 +205,28 @@ def contention_greenctx_decodes(decode_wrapper, prefill_fn, B_dec, B_prefill):
 
   # prefil for one request saturates compute
   activation_prefill = torch.randn((B_prefill, S, D), dtype = torch.float16, device = "cuda") 
+
+  # Set up FlashInfer wrapper object for decode
+
+  # Set up paging config of KV cache
+  workspace_dec = torch.zeros(128 * 1024 * 1024, dtype = torch.uint8, device = "cuda")
+  decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(workspace_dec, "NHD")
+
+  page_size = S
+  num_pages = B_dec
+  kv_indptr = torch.arange(0, B_dec + 1, dtype = torch.int32, device = "cuda")
+  kv_indices = torch.arange(0, B_dec, dtype = torch.int32, device = "cuda")
+  kv_last_page_len = torch.full((B_dec, ), S, dtype = torch.int32, device = "cuda")
+
+  decode_wrapper.plan(kv_indptr, kv_indices, kv_last_page_len,
+    num_qo_heads = N, num_kv_heads = N, head_dim = H, page_size = S)
+
+  # Set up FlashInfer wrapper object for prefill
+  workspace_prefill = torch.zeros(128 * 1024 * 1024, dtype = torch.uint8, device = "cuda")
+  prefill_wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(workspace_buffer, "NHD")
+  qo_indptr = torch.arange(0, (B_prefill + 1) * S, S, dtype=torch.int32, device="cuda:0")
+  kv_indptr = qo_indptr.clone()
+  prefill_wrapper.plan(qo_indptr, kv_indptr, num_qo_heads = N, num_kv_heads = N, head_dim = H, causal=True)
 
   device_props = torch.cuda.get_device_properties(0)
   num_sms = device_props.multi_processor_count
@@ -239,7 +262,10 @@ def contention_greenctx_decodes(decode_wrapper, prefill_fn, B_dec, B_prefill):
       # Warmup: launch some prefill kernel
       with torch.inference_mode():
         for _ in range(NUM_WARMUPS):
-          out = prefill_fn(activation_prefill)
+          if prefill_fn == 'do_batched_prefill':
+            out = prefill_fn(activation_prefill, prefill_wrapper)
+          else:
+            out = prefill_fn(activation_prefill)
 
     start1 = torch.cuda.Event(enable_timing = True)
     end1 = torch.cuda.Event(enable_timing = True)
@@ -256,7 +282,10 @@ def contention_greenctx_decodes(decode_wrapper, prefill_fn, B_dec, B_prefill):
     with torch.cuda.stream(stream_prefill):
       with torch.inference_mode():
         for _ in range(NUM_ITERS):
-          out = prefill_fn(activation_prefill)
+          if prefill_fn == 'do_batched_prefill':
+            out = prefill_fn(activation_prefill, prefill_wrapper)
+          else:
+            out = prefill_fn(activation_prefill)
     torch.cuda.nvtx.range_pop()
 
     start1.record(stream_dec)
@@ -308,7 +337,7 @@ def no_contention_greenctx_prefill(B_prefill):
   # Warmup: launch some prefill kernels
   with torch.inference_mode():
     for _ in range(NUM_WARMUPS):
-      out = do_serial_prefill(activation)
+      out = do_batched_prefill(activation)
 
   start = torch.cuda.Event(enable_timing = True)
   end = torch.cuda.Event(enable_timing = True)
@@ -320,7 +349,7 @@ def no_contention_greenctx_prefill(B_prefill):
   # Actual prefill runs for timing
   with torch.inference_mode():
     for _ in range(NUM_ITERS):
-      out = do_serial_prefill(activation)
+      out = do_batched_prefill(activation)
 
   end.record()
 
@@ -344,7 +373,7 @@ def no_contention_greenctx_prefill(B_prefill):
       # Warmup: launch some prefill kernel
       with torch.inference_mode():
         for _ in range(NUM_WARMUPS):
-          out = do_serial_prefill(activation)
+          out = do_batched_prefill(activation)
 
       start = torch.cuda.Event(enable_timing = True)
       end = torch.cuda.Event(enable_timing = True)
@@ -356,7 +385,7 @@ def no_contention_greenctx_prefill(B_prefill):
       # Actual prefill runs for timing
       with torch.inference_mode():
         for _ in range(NUM_ITERS):
-          out = do_serial_prefill(activation)
+          out = do_batched_prefill(activation)
 
       end.record()
 
@@ -395,24 +424,11 @@ def run_decode_only_exp():
   df.to_csv(csv_filename, index = False)
 
 def run_decode_contention_exp():
-  # Set up paging config of KV cache
-  workspace = torch.zeros(128 * 1024 * 1024, dtype = torch.uint8, device = "cuda")
 
   B_prefill = 8
   all_batch_results = []
   for B_dec in [32, 64, 128, 256, 512]: # batch size
-    decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(workspace, "NHD")
-
-    page_size = S
-    num_pages = B_dec
-    kv_indptr = torch.arange(0, B_dec + 1, dtype = torch.int32, device = "cuda")
-    kv_indices = torch.arange(0, B_dec, dtype = torch.int32, device = "cuda")
-    kv_last_page_len = torch.full((B_dec, ), S, dtype = torch.int32, device = "cuda")
-
-    decode_wrapper.plan(kv_indptr, kv_indices, kv_last_page_len,
-      num_qo_heads = N, num_kv_heads = N, head_dim = H, page_size = S)
-
-    contention_decode_results = contention_greenctx_decodes(decode_wrapper, do_serial_prefill, B_dec, B_prefill)
+    contention_decode_results = contention_greenctx_decodes(do_batched_prefill, B_dec, B_prefill)
     all_batch_results.append(contention_decode_results)
 
   df = pd.DataFrame(all_batch_results)
@@ -431,8 +447,8 @@ def run_prefill_only_exp():
 
 def main():
 #  run_decode_only_exp()
-  run_decode_contention_exp()
-#  run_prefill_only_exp()
+#  run_decode_contention_exp()
+  run_prefill_only_exp()
 
 if __name__ == "__main__":
   main()
