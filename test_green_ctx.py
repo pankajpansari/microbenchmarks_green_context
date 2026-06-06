@@ -8,7 +8,7 @@ import einops
 _ = torch.empty(1, device='cuda:0')
 
 S = 2048 # sequence len
-D = 4096 # model embedding dim
+D = 8192 # model embedding dim
 N = 32 # number of heads (same for K,Q,V)
 H = D // N # head dimension
 F = 4 * D # FFN hidden dimension
@@ -65,14 +65,14 @@ def do_serial_prefill(x):
 def do_batched_prefill(x, prefill_wrapper):
   
   #x is a batch of prefill token embedding 
-  q = torch.einsum('bsd, dnh -> (bs)nh', x, W_q)
+  b, s = x.shape[0], x.shape[1]
+  q = torch.einsum('bsd, dnh -> bsnh', x, W_q).reshape(b * s, N, H)
 
   #we don't append these to kv cache
-  k = torch.einsum('bsd, dnh -> (bs)nh', x, W_k)
-  v = torch.einsum('bsd, dnh -> (bs)nh', x, W_v)
+  k = torch.einsum('bsd, dnh -> bsnh', x, W_k).reshape(b * s, N, H)
+  v = torch.einsum('bsd, dnh -> bsnh', x, W_v).reshape(b * s, N, H)
 
-  v_attention = prefill_wrapper.run(q, k, v)
-  v_attention = einops.rearrange(v_attention, '(bs)nh -> bsnh', b = x.shape[0])
+  v_attention = prefill_wrapper.run(q, k, v).reshape(b, s, N, H)
 
   o = torch.einsum('bsnh, nhd -> bsd', v_attention, W_o) 
 
@@ -227,7 +227,7 @@ def contention_greenctx_decodes(prefill_fn, B_dec, B_prefill):
   prefill_wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(workspace_prefill, "NHD")
   qo_indptr = torch.arange(0, (B_prefill + 1) * S, S, dtype=torch.int32, device="cuda:0")
   kv_indptr = qo_indptr.clone()
-  prefill_wrapper.plan(qo_indptr, kv_indptr, num_qo_heads = N, num_kv_heads = N, head_dim = H, causal=True)
+  prefill_wrapper.plan(qo_indptr, kv_indptr, num_qo_heads = N, num_kv_heads = N, head_dim_qk = H, causal=True)
 
   device_props = torch.cuda.get_device_properties(0)
   num_sms = device_props.multi_processor_count
@@ -263,7 +263,7 @@ def contention_greenctx_decodes(prefill_fn, B_dec, B_prefill):
       # Warmup: launch some prefill kernel
       with torch.inference_mode():
         for _ in range(NUM_WARMUPS):
-          if prefill_fn == 'do_batched_prefill':
+          if prefill_fn is do_batched_prefill:
             out = prefill_fn(activation_prefill, prefill_wrapper)
           else:
             out = prefill_fn(activation_prefill)
@@ -283,7 +283,7 @@ def contention_greenctx_decodes(prefill_fn, B_dec, B_prefill):
     with torch.cuda.stream(stream_prefill):
       with torch.inference_mode():
         for _ in range(NUM_ITERS):
-          if prefill_fn == 'do_batched_prefill':
+          if prefill_fn is do_batched_prefill:
             out = prefill_fn(activation_prefill, prefill_wrapper)
           else:
             out = prefill_fn(activation_prefill)
@@ -327,7 +327,7 @@ def no_contention_greenctx_prefill(B_prefill):
   qo_indptr = torch.arange(0, (B_prefill + 1) * S, S, dtype=torch.int32, device="cuda:0")
   kv_indptr = qo_indptr.clone()
   prefill_wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(workspace_prefill, "NHD")
-  prefill_wrapper.plan(qo_indptr, kv_indptr, num_qo_heads = N, num_kv_heads = N, head_dim = H, causal=True)
+  prefill_wrapper.plan(qo_indptr, kv_indptr, num_qo_heads = N, num_kv_heads = N, head_dim_qk = H, causal=True)
 
   device_props = torch.cuda.get_device_properties(0)
   num_sms = device_props.multi_processor_count
@@ -374,7 +374,6 @@ def no_contention_greenctx_prefill(B_prefill):
 
     active_sms = num_sms - i*granularity
     streams, resources = split_device_green_ctx_by_sm_count(dev, [active_sms])
-
     target_stream = streams[0]
     with torch.cuda.stream(target_stream):
 
@@ -433,14 +432,14 @@ def run_decode_only_exp():
 
 def run_decode_contention_exp():
 
-  B_prefill = 8
+  B_prefill = 16 
   all_batch_results = []
   for B_dec in [32, 64, 128, 256, 512]: # batch size
     contention_decode_results = contention_greenctx_decodes(do_batched_prefill, B_dec, B_prefill)
     all_batch_results.append(contention_decode_results)
 
   df = pd.DataFrame(all_batch_results)
-  csv_filename = "greenctx_contention_decode_serial_prefill_itl" + "_d" + str(D) + ".csv"
+  csv_filename = "greenctx_contention_decode_batched_prefill_itl" + "_d" + str(D) + ".csv"
   df.to_csv(csv_filename, index = False)
 
 
@@ -450,13 +449,13 @@ def run_prefill_only_exp():
   no_contention_results = no_contention_greenctx_prefill(B_prefill)
 
   df = pd.DataFrame(no_contention_results)
-  csv_filename = "greenctx_no_contention_batched_serial_prefill_tp" + "_d" + str(D) + ".csv"
+  csv_filename = "greenctx_no_contention_batched_prefill_tp" + "_d" + str(D) + ".csv"
   df.to_csv(csv_filename, index = False)
 
 def main():
 #  run_decode_only_exp()
-#  run_decode_contention_exp()
-  run_prefill_only_exp()
+  run_decode_contention_exp()
+#  run_prefill_only_exp()
 
 if __name__ == "__main__":
   main()
