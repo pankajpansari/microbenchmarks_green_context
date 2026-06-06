@@ -3,6 +3,7 @@ import torch.nn.functional as Func
 import flashinfer
 from flashinfer.green_ctx import split_device_green_ctx_by_sm_count
 import pandas as pd
+import einops
 
 _ = torch.empty(1, device='cuda:0')
 
@@ -64,11 +65,11 @@ def do_serial_prefill(x):
 def do_batched_prefill(x, prefill_wrapper):
   
   #x is a batch of prefill token embedding 
-  q = torch.einsum('bsd, dnh -> bsnh', x, W_q).squeeze(1)   
+  q = torch.einsum('bsd, dnh -> (bs)nh', x, W_q)
 
   #we don't append these to kv cache
-  k = torch.einsum('bsd, dnh -> bsnh', x, W_k).squeeze(1)   
-  v = torch.einsum('bsd, dnh -> bsnh', x, W_v).squeeze(1)   
+  k = torch.einsum('bsd, dnh -> (bs)nh', x, W_k)
+  v = torch.einsum('bsd, dnh -> (bs)nh', x, W_v)
 
   v_attention = prefill_wrapper.run(q, k, v)
   v_attention = einops.rearrange(v_attention, '(bs)nh -> bsnh', b = x.shape[0])
@@ -223,7 +224,7 @@ def contention_greenctx_decodes(prefill_fn, B_dec, B_prefill):
 
   # Set up FlashInfer wrapper object for prefill
   workspace_prefill = torch.zeros(128 * 1024 * 1024, dtype = torch.uint8, device = "cuda")
-  prefill_wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(workspace_buffer, "NHD")
+  prefill_wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(workspace_prefill, "NHD")
   qo_indptr = torch.arange(0, (B_prefill + 1) * S, S, dtype=torch.int32, device="cuda:0")
   kv_indptr = qo_indptr.clone()
   prefill_wrapper.plan(qo_indptr, kv_indptr, num_qo_heads = N, num_kv_heads = N, head_dim = H, causal=True)
@@ -321,6 +322,13 @@ def no_contention_greenctx_prefill(B_prefill):
 
   activation = torch.randn((B_prefill, S, D), dtype = torch.float16, device = "cuda")
 
+  # Set up FlashInfer wrapper object for prefill
+  workspace_prefill = torch.zeros(128 * 1024 * 1024, dtype = torch.uint8, device = "cuda")
+  qo_indptr = torch.arange(0, (B_prefill + 1) * S, S, dtype=torch.int32, device="cuda:0")
+  kv_indptr = qo_indptr.clone()
+  prefill_wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(workspace_prefill, "NHD")
+  prefill_wrapper.plan(qo_indptr, kv_indptr, num_qo_heads = N, num_kv_heads = N, head_dim = H, causal=True)
+
   device_props = torch.cuda.get_device_properties(0)
   num_sms = device_props.multi_processor_count
 
@@ -337,7 +345,7 @@ def no_contention_greenctx_prefill(B_prefill):
   # Warmup: launch some prefill kernels
   with torch.inference_mode():
     for _ in range(NUM_WARMUPS):
-      out = do_batched_prefill(activation)
+      out = do_batched_prefill(activation, prefill_wrapper)
 
   start = torch.cuda.Event(enable_timing = True)
   end = torch.cuda.Event(enable_timing = True)
@@ -349,7 +357,7 @@ def no_contention_greenctx_prefill(B_prefill):
   # Actual prefill runs for timing
   with torch.inference_mode():
     for _ in range(NUM_ITERS):
-      out = do_batched_prefill(activation)
+      out = do_batched_prefill(activation, prefill_wrapper)
 
   end.record()
 
@@ -373,7 +381,7 @@ def no_contention_greenctx_prefill(B_prefill):
       # Warmup: launch some prefill kernel
       with torch.inference_mode():
         for _ in range(NUM_WARMUPS):
-          out = do_batched_prefill(activation)
+          out = do_batched_prefill(activation, prefill_wrapper)
 
       start = torch.cuda.Event(enable_timing = True)
       end = torch.cuda.Event(enable_timing = True)
@@ -385,7 +393,7 @@ def no_contention_greenctx_prefill(B_prefill):
       # Actual prefill runs for timing
       with torch.inference_mode():
         for _ in range(NUM_ITERS):
-          out = do_batched_prefill(activation)
+          out = do_batched_prefill(activation, prefill_wrapper)
 
       end.record()
 
