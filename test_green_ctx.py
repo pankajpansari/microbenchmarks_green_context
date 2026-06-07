@@ -194,7 +194,7 @@ def no_contention_greenctx_decodes(decode_wrapper, B):
   return no_contention_results
   print(f"B = {B} no contention green context benchmark done")
 
-def contention_greenctx_decodes(prefill_fn, B_dec, B_prefill):
+def contention_greenctx_decodes(prefill_fn, B_dec, B_prefill, S_prefill):
   # Experiment: Profile decodes with serial prefill running in the other green context 
 
   # Set up KV caches on GPU HBM
@@ -433,13 +433,14 @@ def run_decode_only_exp():
 def run_decode_contention_exp():
 
   B_prefill = 16 
+  S_prefill = 1024 
   all_batch_results = []
   for B_dec in [32, 64, 128, 256, 512]: # batch size
-    contention_decode_results = contention_greenctx_decodes(do_batched_prefill, B_dec, B_prefill)
+    contention_decode_results = contention_greenctx_decodes(do_serial_prefill, B_dec, B_prefill, S_prefill)
     all_batch_results.append(contention_decode_results)
 
   df = pd.DataFrame(all_batch_results)
-  csv_filename = "greenctx_contention_decode_batched_prefill_itl" + "_d" + str(D) + ".csv"
+  csv_filename = "greenctx_contention_decode_serial_prefill_itl_s_" + str(S_prefill) + "_d" + str(D) + ".csv"
   df.to_csv(csv_filename, index = False)
 
 
