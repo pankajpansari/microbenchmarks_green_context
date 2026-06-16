@@ -4,14 +4,18 @@ import flashinfer
 from flashinfer.green_ctx import split_device_green_ctx_by_sm_count
 import pandas as pd
 import einops
+import subprocess, json, sys, socket, datetime
+import os
 
 _ = torch.empty(1, device='cuda:0')
 
-S = 2048 # sequence len
+S_dec= 2048 # sequence len
 D = 8192 # model embedding dim
 N = 32 # number of heads (same for K,Q,V)
 H = D // N # head dimension
 F = 4 * D # FFN hidden dimension
+B_dec_sweep =[32, 64, 128, 256, 512]
+S_prefill_sweep = [512, 1024, 2048]
 
 W_k = torch.randn((D, N, H), dtype = torch.float16, device = "cuda")
 W_q = torch.randn((D, N, H), dtype = torch.float16, device = "cuda")
@@ -85,7 +89,7 @@ def do_batched_prefill(x, prefill_wrapper):
 
 def do_batched_decode(x, paged_kv, decode_wrapper):
   
-  # context len always at S; cache does not grow
+  # context len always at S_dec; cache does not grow
 
   #x is a batch of last generate token embedding 
   q = torch.einsum('bsd, dnh -> bsnh', x, W_q).squeeze(1)   # s = 1 
@@ -104,15 +108,29 @@ def do_batched_decode(x, paged_kv, decode_wrapper):
   output = torch.einsum('bsf, fd -> bsd', o_1, W_out) # s = 1 
   return output
 
-def no_contention_greenctx_decodes(decode_wrapper, B):
+def measure_decode_isolated(B):
   # Setting: Decodes using one green context; remaining SMs outside context idle 
 
   # Set up KV caches on GPU HBM
-  k_cache = torch.randn((B, S, N, H), dtype = torch.float16, device = "cuda")
-  v_cache = torch.randn((B, S, N, H), dtype = torch.float16, device = "cuda")
+  k_cache = torch.randn((B, S_dec, N, H), dtype = torch.float16, device = "cuda")
+  v_cache = torch.randn((B, S_dec, N, H), dtype = torch.float16, device = "cuda")
   paged_kv = torch.stack([k_cache, v_cache], dim = 1)
  
   activation = torch.randn((B, 1, D), dtype = torch.float16, device = "cuda")
+
+  # Set up paging config of KV cache
+  workspace = torch.zeros(128 * 1024 * 1024, dtype = torch.uint8, device = "cuda")
+  decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(workspace, "NHD")
+
+  kv_indptr = torch.arange(0, B + 1, dtype = torch.int32, device = "cuda")
+  kv_indices = torch.arange(0, B, dtype = torch.int32, device = "cuda")
+  kv_last_page_len = torch.full((B, ), S_dec, dtype = torch.int32, device = "cuda")
+
+  # Set up FlashInfer wrapper object for decode
+
+  decode_wrapper.plan(kv_indptr, kv_indices, kv_last_page_len,
+    num_qo_heads = N, num_kv_heads = N, head_dim = H, page_size = S_dec)
+
 
   device_props = torch.cuda.get_device_properties(0)
   num_sms = device_props.multi_processor_count
@@ -123,7 +141,7 @@ def no_contention_greenctx_decodes(decode_wrapper, B):
   granularity = 8
 
   NUM_WARMUPS = 10
-  NUM_ITERS = 100 
+  NUM_ITERS= 100 
   no_contention_results = []
 
   # Without any partition - decodes have all SMs
@@ -192,20 +210,19 @@ def no_contention_greenctx_decodes(decode_wrapper, B):
       no_contention_results.append({"Batch": B, "Active_SMs": active_sms, "Elapsed_time_ms": round(itl, 3)})
 
   return no_contention_results
-  print(f"B = {B} no contention green context benchmark done")
 
-def contention_greenctx_decodes(prefill_fn, B_dec, B_prefill, S_prefill):
+def measure_decode_under_prefill_contention(prefill_fn, B_dec, B_prefill, S_prefill):
   # Experiment: Profile decodes with serial prefill running in the other green context 
 
   # Set up KV caches on GPU HBM
-  k_cache = torch.randn((B_dec, S, N, H), dtype = torch.float16, device = "cuda")
-  v_cache = torch.randn((B_dec, S, N, H), dtype = torch.float16, device = "cuda")
+  k_cache = torch.randn((B_dec, S_dec, N, H), dtype = torch.float16, device = "cuda")
+  v_cache = torch.randn((B_dec, S_dec, N, H), dtype = torch.float16, device = "cuda")
   paged_kv = torch.stack([k_cache, v_cache], dim = 1)
  
   activation_decode = torch.randn((B_dec, 1, D), dtype = torch.float16, device = "cuda")
 
   # prefil for one request saturates compute
-  activation_prefill = torch.randn((B_prefill, S, D), dtype = torch.float16, device = "cuda") 
+  activation_prefill = torch.randn((B_prefill, S_prefill, D), dtype = torch.float16, device = "cuda") 
 
   # Set up FlashInfer wrapper object for decode
 
@@ -213,19 +230,17 @@ def contention_greenctx_decodes(prefill_fn, B_dec, B_prefill, S_prefill):
   workspace_dec = torch.zeros(128 * 1024 * 1024, dtype = torch.uint8, device = "cuda")
   decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(workspace_dec, "NHD")
 
-  page_size = S
-  num_pages = B_dec
   kv_indptr = torch.arange(0, B_dec + 1, dtype = torch.int32, device = "cuda")
   kv_indices = torch.arange(0, B_dec, dtype = torch.int32, device = "cuda")
-  kv_last_page_len = torch.full((B_dec, ), S, dtype = torch.int32, device = "cuda")
+  kv_last_page_len = torch.full((B_dec, ), S_dec, dtype = torch.int32, device = "cuda")
 
   decode_wrapper.plan(kv_indptr, kv_indices, kv_last_page_len,
-    num_qo_heads = N, num_kv_heads = N, head_dim = H, page_size = S)
+    num_qo_heads = N, num_kv_heads = N, head_dim = H, page_size = S_dec)
 
   # Set up FlashInfer wrapper object for prefill
   workspace_prefill = torch.zeros(128 * 1024 * 1024, dtype = torch.uint8, device = "cuda")
   prefill_wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(workspace_prefill, "NHD")
-  qo_indptr = torch.arange(0, (B_prefill + 1) * S, S, dtype=torch.int32, device="cuda:0")
+  qo_indptr = torch.arange(0, (B_prefill + 1) * S_prefill, S_prefill, dtype=torch.int32, device="cuda:0")
   kv_indptr = qo_indptr.clone()
   prefill_wrapper.plan(qo_indptr, kv_indptr, num_qo_heads = N, num_kv_heads = N, head_dim_qk = H, causal=True)
 
@@ -233,8 +248,6 @@ def contention_greenctx_decodes(prefill_fn, B_dec, B_prefill, S_prefill):
   num_sms = device_props.multi_processor_count
 
   dev = torch.device("cuda:0")
-  all_streams = []
-  all_resources = []
   granularity = 8
 
   NUM_WARMUPS = 10 # for decodes
@@ -262,53 +275,66 @@ def contention_greenctx_decodes(prefill_fn, B_dec, B_prefill, S_prefill):
     with torch.cuda.stream(stream_prefill):
       # Warmup: launch some prefill kernel
       with torch.inference_mode():
-        for _ in range(NUM_WARMUPS):
+        for _ in range(NUM_WARMUPS / 2):
           if prefill_fn is do_batched_prefill:
             out = prefill_fn(activation_prefill, prefill_wrapper)
           else:
             out = prefill_fn(activation_prefill)
 
-    start1 = torch.cuda.Event(enable_timing = True)
-    end1 = torch.cuda.Event(enable_timing = True)
-    start2 = torch.cuda.Event(enable_timing = True)
-    end2 = torch.cuda.Event(enable_timing = True)
+    prefill_iters = 2
+    
+    for _ in range(8):
+      start1 = torch.cuda.Event(enable_timing = True)
+      end1 = torch.cuda.Event(enable_timing = True)
+      start2 = torch.cuda.Event(enable_timing = True)
+      end2 = torch.cuda.Event(enable_timing = True)
 
-    torch.cuda.synchronize()
+      torch.cuda.synchronize()
 
-    start2.record(stream_prefill)
+      start2.record(stream_prefill)
 
-    torch.cuda.nvtx.range_push("prefill")
-    # inverting order so that prefills are underway before
-    # decode kernels start executing from other stream
-    with torch.cuda.stream(stream_prefill):
-      with torch.inference_mode():
-        for _ in range(NUM_ITERS):
-          if prefill_fn is do_batched_prefill:
-            out = prefill_fn(activation_prefill, prefill_wrapper)
-          else:
-            out = prefill_fn(activation_prefill)
-    torch.cuda.nvtx.range_pop()
+      torch.cuda.nvtx.range_push("prefill")
+      # inverting order so that prefills are underway before
+      # decode kernels start executing from other stream
+      with torch.cuda.stream(stream_prefill):
+        with torch.inference_mode():
+          for _ in range(prefill_iters):
+            if prefill_fn is do_batched_prefill:
+              out = prefill_fn(activation_prefill, prefill_wrapper)
+            else:
+              out = prefill_fn(activation_prefill)
+      torch.cuda.nvtx.range_pop()
 
-    start1.record(stream_dec)
+      start1.record(stream_dec)
 
-    torch.cuda.nvtx.range_push("decode")
-    with torch.cuda.stream(stream_dec):
-      with torch.inference_mode():
-        for _ in range(NUM_ITERS):
-          out = do_batched_decode(activation_decode, paged_kv, decode_wrapper)
-    torch.cuda.nvtx.range_pop()
+      torch.cuda.nvtx.range_push("decode")
+      with torch.cuda.stream(stream_dec):
+        with torch.inference_mode():
+          for _ in range(NUM_ITERS):
+            out = do_batched_decode(activation_decode, paged_kv, decode_wrapper)
+      torch.cuda.nvtx.range_pop()
 
-    end1.record(stream_dec)
-    end2.record(stream_prefill)
+      end1.record(stream_dec)
+      end2.record(stream_prefill)
 
-    stream_dec.synchronize()
-    stream_prefill.synchronize()
+      stream_dec.synchronize()
+      stream_prefill.synchronize()
 
 
-    elapsedTime1 = start1.elapsed_time(end1)
-    elapsedTime2 = start2.elapsed_time(end2)
+      elapsedTime1 = start1.elapsed_time(end1)
+      elapsedTime2 = start2.elapsed_time(end2)
 
-    assert (elapsedTime2 > elapsedTime1) #green context running prefill should never be idle for this benchmark to work
+      if elapsedTime2 > 1.2 * elapsedTime1:
+        #green context running prefill should never be idle for this benchmark to work
+        break
+
+      prefill_iters *= 2
+
+
+    if (elapsedTime2 <= 1.2*elapsedTime1): # prefill iter scaling got capped; abort run
+      print(f"WARN: prefill didn't cover decode at active_sms={active_sms}, skipping")
+      continue
+
     itl = elapsedTime1 / NUM_ITERS
 
     print(f"(Batch Size: {B_dec}, Active SMs: {active_sms}) inter_token_latency (ms): {itl:.3f} Decode total time (ms): {elapsedTime1:.1f} Prefill total time (ms): {elapsedTime2:.1f}")
@@ -321,7 +347,7 @@ def contention_greenctx_prefill(prefill_fn, B_dec, B_prefill, S_prefill):
   # Experiment: Profile prefills with decodes running in the other green context 
 
   # Set up KV caches on GPU HBM
-  paged_kv = torch.randn((B_dec, 2, S, N, H), dtype = torch.float16, device = "cuda")
+  paged_kv = torch.randn((B_dec, 2, S_dec, N, H), dtype = torch.float16, device = "cuda")
  
   activation_decode = torch.randn((B_dec, 1, D), dtype = torch.float16, device = "cuda")
 
@@ -333,14 +359,14 @@ def contention_greenctx_prefill(prefill_fn, B_dec, B_prefill, S_prefill):
   workspace_dec = torch.zeros(128 * 1024 * 1024, dtype = torch.uint8, device = "cuda")
   decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(workspace_dec, "NHD")
 
-  page_size = S
+  page_size = S_dec
   num_pages = B_dec
   kv_indptr = torch.arange(0, B_dec + 1, dtype = torch.int32, device = "cuda")
   kv_indices = torch.arange(0, B_dec, dtype = torch.int32, device = "cuda")
-  kv_last_page_len = torch.full((B_dec, ), S, dtype = torch.int32, device = "cuda")
+  kv_last_page_len = torch.full((B_dec, ), S_dec, dtype = torch.int32, device = "cuda")
 
   decode_wrapper.plan(kv_indptr, kv_indices, kv_last_page_len,
-    num_qo_heads = N, num_kv_heads = N, head_dim = H, page_size = S)
+    num_qo_heads = N, num_kv_heads = N, head_dim = H, page_size = S_dec)
 
   # Set up FlashInfer wrapper object for prefill
   workspace_prefill = torch.zeros(128 * 1024 * 1024, dtype = torch.uint8, device = "cuda")
@@ -467,8 +493,8 @@ def no_contention_greenctx_prefill(B_prefill):
   all_resources = []
   granularity = 8
 
-  NUM_WARMUPS = 10
-  NUM_ITERS = 100 
+  NUM_WARMUPS_dec= 10
+  NUM_ITERS_dec= 100 
   no_contention_results = []
 
   # Without any partition - prefill has all SMs
@@ -493,7 +519,7 @@ def no_contention_greenctx_prefill(B_prefill):
 
   torch.cuda.synchronize()
 
-  prefill_tp = int((B_prefill * S * NUM_ITERS * 1000)/ start.elapsed_time(end)) # Num of tokens processed/time (toks/s)
+  prefill_tp = int((B_prefill * S_dec* NUM_ITERS_dec* 1000)/ start.elapsed_time(end)) # Num of tokens processed/time (toks/s)
 
   print(f"Without contention (Active SMs: {num_sms}) througput (toks/s): {prefill_tp}")
 
@@ -528,7 +554,7 @@ def no_contention_greenctx_prefill(B_prefill):
 
       target_stream.synchronize()
 
-      prefill_tp = int((B_prefill * S * NUM_ITERS * 1000)/ start.elapsed_time(end)) # Num of tokens processed/time (toks/s)
+      prefill_tp = int((B_prefill * S_dec* NUM_ITERS_dec* 1000)/ start.elapsed_time(end)) # Num of tokens processed/time (toks/s)
 
       print(f"Without contention (Active SMs: {active_sms}) througput (toks/s): {prefill_tp}")
 
@@ -536,55 +562,65 @@ def no_contention_greenctx_prefill(B_prefill):
 
   return no_contention_results
 
-def run_decode_only_exp():
-  # Set up paging config of KV cache
-  workspace = torch.zeros(128 * 1024 * 1024, dtype = torch.uint8, device = "cuda")
+def generate_csv_header_sidecar(df, params, out_dir = "data"):
+  
+  commit_hash = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
+  dirty = bool(subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"], capture_output=True, 
+                         text=True).stdout.strip())
+  gpu = torch.cuda.get_device_name(0)
+  now = datetime.datetime.now()
+  timestamp = now.isoformat(timespec='seconds')
+  command = " ".join(sys.argv)
+
+  stamp = now.strftime("%Y%m%d-%H%M")
+  gpu_slug = torch.cuda.get_device_name(0).replace(" ", "-")
+  csv_filename = f"{out_dir}/{params['exp']}__d{params['D']}__{gpu_slug}__{stamp}.csv"
+
+  meta = {"commit_hash": commit_hash, "dirty": dirty, "gpu": gpu, "timestamp": timestamp, 
+          "command": command, "params": params}
+  
+  os.makedirs(out_dir, exist_ok = True)
+  with open(f"{csv_filename}.meta.json", "w") as f:
+    json.dump(meta, f, indent = 2)  
+
+  header = "# " + " ".join(f"{k}={meta[k]}" for k in ["commit_hash", "dirty", "gpu", "timestamp"]) 
+
+  with open(csv_filename, "w", newline="") as f:
+    f.write(header + "\n")
+    df.to_csv(f, index=False)
+
+
+def run_decode_isolated_experiment():
 
   all_batch_results = []
-  for B in [32, 64, 128, 256, 512]: # batch size
-    decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(workspace, "NHD")
-
-    page_size = S
-    num_pages = B
-    kv_indptr = torch.arange(0, B + 1, dtype = torch.int32, device = "cuda")
-    kv_indices = torch.arange(0, B, dtype = torch.int32, device = "cuda")
-    kv_last_page_len = torch.full((B, ), S, dtype = torch.int32, device = "cuda")
-
-    decode_wrapper.plan(kv_indptr, kv_indices, kv_last_page_len,
-      num_qo_heads = N, num_kv_heads = N, head_dim = H, page_size = S)
-
-    no_contention_results = no_contention_greenctx_decodes(decode_wrapper, B)
+  for B in B_dec_sweep: # batch size
+    no_contention_results = measure_decode_isolated(B)
     all_batch_results.append(no_contention_results)
 
   df = pd.DataFrame([row for sub in all_batch_results for row in sub])
-  csv_filename = "greenctx_no_contention_decode_itl" + "_d" + str(D) + ".csv"
-  df.to_csv(csv_filename, index = False)
+  
+  params = {"B_dec_sweep": B_dec_sweep, "S_dec": S_dec, "D": D, "num_kv_heads": N, "H": H, 
+            "F": F, "exp": "decode_only_no_contention"}
 
-def run_prefill_contention_exp():
+  generate_csv_header_sidecar(df, params)
 
-  B_prefill = 8 
-  S_prefill = 2048
-  all_batch_results = []
-  for B_dec in [32, 64, 128, 256, 512]: # batch size
-    contention_prefill_results = contention_greenctx_prefill(do_serial_prefill, B_dec, B_prefill, S_prefill)
-    all_batch_results.append(contention_prefill_results)
-
-  df = pd.DataFrame([row for sub in all_batch_results for row in sub])
-  csv_filename = f"greenctx_contention_serial_prefill_tp_s_{S_prefill}_d{D}.csv"
-  df.to_csv(csv_filename, index = False)
-
-def run_decode_contention_exp():
+def run_decode_vs_prefill_experiment(prefill_fn):
 
   B_prefill = 16 
-  S_prefill = 1024 
   all_batch_results = []
-  for B_dec in [32, 64, 128, 256, 512]: # batch size
-    contention_decode_results = contention_greenctx_decodes(do_serial_prefill, B_dec, B_prefill, S_prefill)
-    all_batch_results.append(contention_decode_results)
+
+  for S_prefill in S_prefill_sweep:
+    for B_dec in B_dec_sweep: # batch size
+      contention_decode_results = measure_decode_under_prefill_contention(prefill_fn, B_dec, B_prefill, S_prefill)
+      all_batch_results.append(contention_decode_results)
 
   df = pd.DataFrame([row for sub in all_batch_results for row in sub])
-  csv_filename = "greenctx_contention_decode_serial_prefill_itl_s_" + str(S_prefill) + "_d" + str(D) + ".csv"
-  df.to_csv(csv_filename, index = False)
+
+  params = {"B_dec_sweep": B_dec_sweep, "S_dec": S_dec, "S_prefill_sweep": S_prefill_sweep, "D": D, 
+            "num_kv_heads": N, "H": H, "F": F, "prefill_fn": prefill_fn.__name__, 
+            "exp": f"decode_with_prefill_contention_{prefill_fn.__name__}"}
+
+  generate_csv_header_sidecar(df, params)
 
 def run_prefill_only_exp():
 
@@ -595,10 +631,34 @@ def run_prefill_only_exp():
   csv_filename = "greenctx_no_contention_batched_prefill_tp" + "_d" + str(D) + ".csv"
   df.to_csv(csv_filename, index = False)
 
+def run_prefill_contention_exp():
+
+  B_prefill = 8 
+  S_prefill = 2048
+  all_batch_results = []
+  for B_dec in B_dec_sweep: # batch size
+    contention_prefill_results = contention_greenctx_prefill(do_serial_prefill, B_dec, B_prefill, S_prefill)
+    all_batch_results.append(contention_prefill_results)
+
+  df = pd.DataFrame([row for sub in all_batch_results for row in sub])
+
+  params = {"B_dec_sweep": B_dec_sweep, "S_dec": S_dec, "S_prefill": S_prefill, "D": D, 
+            "num_kv_heads": N, "H": H, "F": F, "exp": "prefill_with_decode_contention"}
+
+  generate_csv_header_sidecar(df, params)
+
+
 def main():
-#  run_decode_only_exp()
-#  run_decode_contention_exp()
-  run_prefill_contention_exp()
+  # Decode with no prefill contention; varying batch size, partition configs 
+  run_decode_isolated_experiment()
+
+  # Decode contention with serial prefill in other green context; varying prefill context length
+  run_decode_vs_prefill_experiment(do_serial_prefill)
+
+  # Decode contention with batched prefill in other green context; fixed prefill context length 
+  run_decode_vs_prefill_experiment(do_batched_prefill)
+
+#  run_prefill_contention_exp()
 #  run_prefill_only_exp()
 
 if __name__ == "__main__":
