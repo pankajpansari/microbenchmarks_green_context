@@ -4,6 +4,13 @@ from config import S_dec
 from flashinfer.green_ctx import split_device_green_ctx_by_sm_count
 import logging
 
+partitions = {}
+def get_green_ctx(active_sms):
+  if active_sms not in partitions:
+    dev = torch.device("cuda:0")
+    partitions[active_sms] = split_device_green_ctx_by_sm_count(dev, [active_sms])
+
+  return partitions[active_sms]
 
 def measure_decode_isolated(mdl, B):
   # Setting: Decodes using one green context; remaining SMs outside context idle 
@@ -70,7 +77,7 @@ def measure_decode_isolated(mdl, B):
   for i in range(1, num_sms // granularity):
 
     active_sms = num_sms - i*granularity
-    streams, resources = split_device_green_ctx_by_sm_count(dev, [active_sms])
+    streams, resources = get_green_ctx(active_sms) 
 
     target_stream = streams[0]
     with torch.cuda.stream(target_stream):
@@ -148,7 +155,7 @@ def measure_decode_under_prefill_contention(mdl, prefill_fn, B_dec, B_prefill, S
 
     active_sms = num_sms - i*granularity
     # Create green contexts
-    streams, resources = split_device_green_ctx_by_sm_count(dev, [active_sms])
+    streams, resources = get_green_ctx(active_sms) 
 
     stream_dec = streams[0] 
     stream_prefill = streams[1] 
@@ -171,7 +178,7 @@ def measure_decode_under_prefill_contention(mdl, prefill_fn, B_dec, B_prefill, S
     prefill_iters = 2
     
     covered = False
-    for _ in range(8):
+    for _ in range(10):
       start1 = torch.cuda.Event(enable_timing = True)
       end1 = torch.cuda.Event(enable_timing = True)
       start2 = torch.cuda.Event(enable_timing = True)
