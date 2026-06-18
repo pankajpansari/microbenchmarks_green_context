@@ -1,3 +1,4 @@
 transformers<5
 accelerate
 ipython
+pandas
