@@ -1,18 +1,17 @@
 import torch
 import flashinfer
-from config import S_dec, D, N, H
-import model
+from config import S_dec 
 from flashinfer.green_ctx import split_device_green_ctx_by_sm_count
 
-def measure_decode_isolated(B):
+def measure_decode_isolated(mdl, B):
   # Setting: Decodes using one green context; remaining SMs outside context idle 
 
   # Set up KV caches on GPU HBM
-  k_cache = torch.randn((B, S_dec, N, H), dtype = torch.float16, device = "cuda")
-  v_cache = torch.randn((B, S_dec, N, H), dtype = torch.float16, device = "cuda")
+  k_cache = torch.randn((B, S_dec, mdl.N, mdl.H), dtype = torch.float16, device = "cuda")
+  v_cache = torch.randn((B, S_dec, mdl.N, mdl.H), dtype = torch.float16, device = "cuda")
   paged_kv = torch.stack([k_cache, v_cache], dim = 1)
  
-  activation = torch.randn((B, 1, D), dtype = torch.float16, device = "cuda")
+  activation = torch.randn((B, 1, mdl.D), dtype = torch.float16, device = "cuda")
 
   # Set up paging config of KV cache
   workspace = torch.zeros(128 * 1024 * 1024, dtype = torch.uint8, device = "cuda")
@@ -25,7 +24,7 @@ def measure_decode_isolated(B):
   # Set up FlashInfer wrapper object for decode
 
   decode_wrapper.plan(kv_indptr, kv_indices, kv_last_page_len,
-    num_qo_heads = N, num_kv_heads = N, head_dim = H, page_size = S_dec)
+    num_qo_heads = mdl.N, num_kv_heads = mdl.N, head_dim = mdl.H, page_size = S_dec)
 
 
   device_props = torch.cuda.get_device_properties(0)
@@ -42,7 +41,7 @@ def measure_decode_isolated(B):
   # Warmup: launch some decode kernel
   with torch.inference_mode():
     for _ in range(NUM_WARMUPS):
-      out = model.do_batched_decode(activation, paged_kv, decode_wrapper)
+      _ = mdl.do_batched_decode(activation, paged_kv, decode_wrapper)
 
   start = torch.cuda.Event(enable_timing = True)
   end = torch.cuda.Event(enable_timing = True)
@@ -54,7 +53,7 @@ def measure_decode_isolated(B):
   # Actual decode runs for timing
   with torch.inference_mode():
     for _ in range(NUM_ITERS):
-      out = model.do_batched_decode(activation, paged_kv, decode_wrapper)
+      _ = mdl.do_batched_decode(activation, paged_kv, decode_wrapper)
 
   end.record()
 
@@ -79,7 +78,7 @@ def measure_decode_isolated(B):
       # Warmup: launch some decode kernel
       with torch.inference_mode():
         for _ in range(NUM_WARMUPS):
-          out = model.do_batched_decode(activation, paged_kv, decode_wrapper)
+          out = mdl.do_batched_decode(activation, paged_kv, decode_wrapper)
 
       start = torch.cuda.Event(enable_timing = True)
       end = torch.cuda.Event(enable_timing = True)
@@ -91,7 +90,7 @@ def measure_decode_isolated(B):
       # Actual decode runs for timing
       with torch.inference_mode():
         for _ in range(NUM_ITERS):
-          out = model.do_batched_decode(activation, paged_kv, decode_wrapper)
+          out = mdl.do_batched_decode(activation, paged_kv, decode_wrapper)
 
       end.record()
 
@@ -99,24 +98,21 @@ def measure_decode_isolated(B):
 
       itl = start.elapsed_time(end) / NUM_ITERS
 
-      print(f"Without contention (Batch Size: {B}, Active SMs: {active_sms}) inter_token_latency (ms): {itl:.3f}")
+      print(f"Without contention restricted SMs (Batch Size: {B}, Active SMs: {active_sms}) inter_token_latency (ms): {itl:.3f}")
 
       no_contention_results.append({"Batch": B, "Active_SMs": active_sms, "Elapsed_time_ms": round(itl, 3)})
 
   return no_contention_results
 
-def measure_decode_under_prefill_contention(prefill_fn, B_dec, B_prefill, S_prefill):
+def measure_decode_under_prefill_contention(mdl, prefill_fn, B_dec, B_prefill, S_prefill):
   # Experiment: Profile decodes with serial or batched prefill running in the other green context 
 
   # Set up KV caches on GPU HBM
-  k_cache = torch.randn((B_dec, S_dec, N, H), dtype = torch.float16, device = "cuda")
-  v_cache = torch.randn((B_dec, S_dec, N, H), dtype = torch.float16, device = "cuda")
-  paged_kv = torch.stack([k_cache, v_cache], dim = 1)
+  paged_kv = torch.randn((B_dec, 2, S_dec, mdl.N, mdl.H), dtype = torch.float16, device = "cuda")
  
-  activation_decode = torch.randn((B_dec, 1, D), dtype = torch.float16, device = "cuda")
+  activation_decode = torch.randn((B_dec, 1, mdl.D), dtype = torch.float16, device = "cuda")
 
-  # prefil for one request saturates compute
-  activation_prefill = torch.randn((B_prefill, S_prefill, D), dtype = torch.float16, device = "cuda") 
+  activation_prefill = torch.randn((B_prefill, S_prefill, mdl.D), dtype = torch.float16, device = "cuda") 
 
   # Set up FlashInfer wrapper object for decode
 
@@ -129,14 +125,14 @@ def measure_decode_under_prefill_contention(prefill_fn, B_dec, B_prefill, S_pref
   kv_last_page_len = torch.full((B_dec, ), S_dec, dtype = torch.int32, device = "cuda")
 
   decode_wrapper.plan(kv_indptr, kv_indices, kv_last_page_len,
-    num_qo_heads = N, num_kv_heads = N, head_dim = H, page_size = S_dec)
+    num_qo_heads = mdl.N, num_kv_heads = mdl.N, head_dim = mdl.H, page_size = S_dec)
 
   # Set up FlashInfer wrapper object for prefill
   workspace_prefill = torch.zeros(128 * 1024 * 1024, dtype = torch.uint8, device = "cuda")
   prefill_wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(workspace_prefill, "NHD")
-  qo_indptr = torch.arange(0, (B_prefill + 1) * S_prefill, S_prefill, dtype=torch.int32, device="cuda:0")
+  qo_indptr = torch.arange(0, (B_prefill + 1) * S_prefill, S_prefill, dtype=torch.int32, device="cuda:0") # ragged-layout, equal-len segments
   kv_indptr = qo_indptr.clone()
-  prefill_wrapper.plan(qo_indptr, kv_indptr, num_qo_heads = N, num_kv_heads = N, head_dim_qk = H, causal=True)
+  prefill_wrapper.plan(qo_indptr, kv_indptr, num_qo_heads = mdl.N, num_kv_heads = mdl.N, head_dim_qk = mdl.H, causal=True)
 
   device_props = torch.cuda.get_device_properties(0)
   num_sms = device_props.multi_processor_count
@@ -164,19 +160,20 @@ def measure_decode_under_prefill_contention(prefill_fn, B_dec, B_prefill, S_pref
       # Warmup: launch some decode kernel
       with torch.inference_mode():
         for _ in range(NUM_WARMUPS):
-          out = model.do_batched_decode(activation_decode, paged_kv, decode_wrapper)
+          out = mdl.do_batched_decode(activation_decode, paged_kv, decode_wrapper)
 
     with torch.cuda.stream(stream_prefill):
       # Warmup: launch some prefill kernel
       with torch.inference_mode():
         for _ in range(NUM_WARMUPS // 2):
-          if prefill_fn is model.do_batched_prefill:
+          if prefill_fn.__name__ ==  "do_batched_prefill":
             out = prefill_fn(activation_prefill, prefill_wrapper)
           else:
             out = prefill_fn(activation_prefill)
 
     prefill_iters = 2
     
+    covered = False
     for _ in range(8):
       start1 = torch.cuda.Event(enable_timing = True)
       end1 = torch.cuda.Event(enable_timing = True)
@@ -193,7 +190,7 @@ def measure_decode_under_prefill_contention(prefill_fn, B_dec, B_prefill, S_pref
       with torch.cuda.stream(stream_prefill):
         with torch.inference_mode():
           for _ in range(prefill_iters):
-            if prefill_fn is model.do_batched_prefill:
+            if prefill_fn.__name__ == "do_batched_prefill":
               out = prefill_fn(activation_prefill, prefill_wrapper)
             else:
               out = prefill_fn(activation_prefill)
@@ -205,7 +202,7 @@ def measure_decode_under_prefill_contention(prefill_fn, B_dec, B_prefill, S_pref
       with torch.cuda.stream(stream_dec):
         with torch.inference_mode():
           for _ in range(NUM_ITERS):
-            out = model.do_batched_decode(activation_decode, paged_kv, decode_wrapper)
+            out = mdl.do_batched_decode(activation_decode, paged_kv, decode_wrapper)
       torch.cuda.nvtx.range_pop()
 
       end1.record(stream_dec)
@@ -219,13 +216,14 @@ def measure_decode_under_prefill_contention(prefill_fn, B_dec, B_prefill, S_pref
       elapsedTime2 = start2.elapsed_time(end2)
 
       if elapsedTime2 > 1.2 * elapsedTime1:
+        covered = True
         #green context running prefill should never be idle for this benchmark to work
         break
 
       prefill_iters *= 2
 
 
-    if (elapsedTime2 <= 1.2*elapsedTime1): # prefill iter scaling got capped; abort run
+    if not covered: # prefill iter scaling got capped; abort run
       print(f"WARN: prefill didn't cover decode at active_sms={active_sms}, skipping")
       continue
 
