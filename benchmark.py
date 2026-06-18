@@ -2,6 +2,8 @@ import torch
 import flashinfer
 from config import S_dec 
 from flashinfer.green_ctx import split_device_green_ctx_by_sm_count
+import logging
+
 
 def measure_decode_isolated(mdl, B):
   # Setting: Decodes using one green context; remaining SMs outside context idle 
@@ -61,8 +63,6 @@ def measure_decode_isolated(mdl, B):
 
   itl = start.elapsed_time(end) / NUM_ITERS
 
-  print(f"Without contention (Batch Size: {B}, Active SMs: {num_sms}) inter_token_latency (ms): {itl:.3f}")
-
   no_contention_results.append({"Batch": B, "Active_SMs": num_sms, "Elapsed_time_ms": round(itl, 3)})
 
 
@@ -97,8 +97,6 @@ def measure_decode_isolated(mdl, B):
       target_stream.synchronize()
 
       itl = start.elapsed_time(end) / NUM_ITERS
-
-      print(f"Without contention restricted SMs (Batch Size: {B}, Active SMs: {active_sms}) inter_token_latency (ms): {itl:.3f}")
 
       no_contention_results.append({"Batch": B, "Active_SMs": active_sms, "Elapsed_time_ms": round(itl, 3)})
 
@@ -145,7 +143,6 @@ def measure_decode_under_prefill_contention(mdl, prefill_fn, B_dec, B_prefill, S
   contention_decode_results = []
 
   # Sweep over partition configs. Create green context + associated stream for each 
-  print(f"With serial-prefill contention")
 
   for i in range(1, num_sms // granularity):
 
@@ -224,12 +221,11 @@ def measure_decode_under_prefill_contention(mdl, prefill_fn, B_dec, B_prefill, S
 
 
     if not covered: # prefill iter scaling got capped; abort run
-      print(f"WARN: prefill didn't cover decode at active_sms={active_sms}, skipping")
+      logging.warning(f"{prefill_fn.__name__} didn't cover decode at D = {mdl.D}, B_prefill = {B_prefill}, B_dec = {B_dec}, "
+                      f"S_prefill = {S_prefill}, S_dec = {S_dec}, active_sms={active_sms}, skipping")
       continue
 
     itl = elapsedTime1 / NUM_ITERS
-
-    print(f"(Batch Size: {B_dec}, Active SMs: {active_sms}) inter_token_latency (ms): {itl:.3f} Decode total time (ms): {elapsedTime1:.1f} Prefill total time (ms): {elapsedTime2:.1f}")
 
     contention_decode_results.append({"Batch": B_dec, "Active_SMs": active_sms, "ITL_ms": round(itl, 3)})
 
