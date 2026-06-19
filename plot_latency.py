@@ -50,7 +50,9 @@ def plot_delta_decode_info():
 def plot_delta_decode_itl():
   df1 = pd.read_csv('data/greenctx_no_contention_decode_itl_d8192.csv')
   df2 = pd.read_csv('data/greenctx_contention_decode_serial_prefill_itl_d8192.csv')
-  df3 = pd.read_csv('data/greenctx_contention_decode_batched_prefill_itl_d8192.csv')
+#  df3 = pd.read_csv('data/greenctx_contention_decode_batched_prefill_itl_d8192.csv')
+  df3 = pd.read_csv('data/greenctx_contention_decode_serial_prefill_itl_s_1024_d8192.csv')
+  df4 = pd.read_csv('data/greenctx_contention_decode_serial_prefill_itl_s_512_d8192.csv')
 #  active_sms = {'80/20': 108, '60/40': 76, '40/60': 52}
 #  colors = {'80/20': "tab:blue", '60/40': "tab:green", '40/60': "tab:purple"}
 
@@ -68,12 +70,16 @@ def plot_delta_decode_itl():
     y.reset_index(drop = True, inplace = True)
     z = df3[df3['Active_SMs'] == sm]['ITL_ms'] 
     z.reset_index(drop = True, inplace = True)
+    l = df4[df4['Active_SMs'] == sm]['ITL_ms'] 
+    l.reset_index(drop = True, inplace = True)
     delta_itl_percent1 = ((y - x) * 100)/ x
     delta_itl_percent2 = ((z - x) * 100)/ x
+    delta_itl_percent3 = ((l - x) * 100)/ x
 
     c = colors[sm_key]
-    ax.plot(batches[:-1], delta_itl_percent1[:-1], marker = 'o', color = c, linestyle = '-')
-    ax.plot(batches[:-1], delta_itl_percent2[:-1], marker = 'o', color = c, linestyle = ':')
+    ax.plot(batches, delta_itl_percent1, marker = 'o', color = c, linestyle = '-')
+    ax.plot(batches, delta_itl_percent2, marker = 's', color = c, linestyle = '-')
+    ax.plot(batches, delta_itl_percent3, marker = '^', color = c, linestyle = '-')
   
 #    for (batch, delta1, delta2) in zip(batches, delta_itl_percent1, delta_itl_percent2):
 #      if (batch != batches[0]):
@@ -91,10 +97,33 @@ def plot_delta_decode_itl():
   handles = [Line2D([0], [0], color=c, lw=2, label=split) for split, c in colors.items()]
   ax.legend(handles=handles, title="SM split", loc='upper left', bbox_to_anchor=(1.02, 1))
 
-  plt.savefig('plots/delta_itl_serial_batched_prefill_d8192.png', bbox_inches='tight')
+  plt.savefig('plots/delta_itl_serial_prefill_short_d8192.png', bbox_inches='tight')
 
-def plot_prefill_info(csv_filename, target_filename):
-  df = pd.read_csv(csv_filename)
+def plot_prefill_info():
+#  df = pd.read_csv('data/greenctx_contention_serial_prefill_tp_s_2048_d4096.csv')
+  df = pd.read_csv('data/greenctx_contention_batched_prefill_tp_s_2048_d4096.csv')
+  batches = df['Decode_batch'].unique()
+
+  df2 = pd.read_csv('data/greenctx_no_contention_batched_prefill_tp_d4096.csv')
+
+  fig, ax = plt.subplots()
+  for batch in batches:
+    df_batch = df[df['Decode_batch'] == batch]
+    ax.plot(df_batch['Active_SMs'], df_batch['Throughput_toks_s'], marker = 'o', linestyle = '-', label = 'B: ' + str(batch))
+
+  ax.plot(df2['Active_SMs'], df2['Throughput_toks_s'], marker = 'o', linestyle = ':')
+
+  ax.set_xlabel('Num of SMs')
+  ax.set_ylabel('Single layer prefill throughput (toks/s)')
+  ax.legend(title = 'Batch size')
+
+  plt.savefig('plots/compare_tp_batch_prefill_s_2048.png', bbox_inches = 'tight')
+
+
+#  df1 = pd.read_csv('data/greenctx_no_contention_batched_serial_prefill_tp_d4096.csv')
+#  df2 = pd.read_csv('data/')
+#  df2 = pd.read_csv()
+#  df2 = pd.read_csv()
 
 #  records = []
 #  for _, row in df.iterrows():
@@ -103,16 +132,16 @@ def plot_prefill_info(csv_filename, target_filename):
 #
 #  df_flat = pd.DataFrame(records)
 
-  df_flat = df
-  fig, ax = plt.subplots()
-
-  ax.plot(df_flat['Active_SMs'], df_flat['Throughput_toks_s'], marker = 'o', linestyle = '-')
-
-  ax.set_xlabel('Num of SMs')
-  ax.set_ylabel('Single layer prefill throughput (toks/s)')
-  ax.set_title('Prefill in green context without contention')
-
-  plt.savefig(target_filename, bbox_inches = 'tight')
+#  df_flat = df
+#  fig, ax = plt.subplots()
+#
+#  ax.plot(df_flat['Active_SMs'], df_flat['Throughput_toks_s'], marker = 'o', linestyle = '-')
+#
+#  ax.set_xlabel('Num of SMs')
+#  ax.set_ylabel('Single layer prefill throughput (toks/s)')
+#  ax.set_title('Prefill in green context without contention')
+#
+#  plt.savefig(target_filename, bbox_inches = 'tight')
 
 def main():
 #  parser = argparse.ArgumentParser()
@@ -121,7 +150,8 @@ def main():
 #  args = parser.parse_args()
 #  plot_decode_info(args.data_filename, args.plot_filename)
 #  plot_delta_decode_info()
-  plot_delta_decode_itl()
+#  plot_delta_decode_itl()
+  plot_prefill_info()
 
 if __name__ == "__main__":
   main() 
