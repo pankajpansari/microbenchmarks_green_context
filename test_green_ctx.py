@@ -35,7 +35,7 @@ def run_decode_vs_prefill_experiment(mdl,prefill_fn):
 
   df = pd.DataFrame([row for sub in all_batch_results for row in sub])
 
-  params = {"B_dec_sweep": B_dec_sweep, "S_dec": S_dec, "S_prefill_sweep": S_prefill_sweep, "D": mdl.D, 
+  params = {"B_dec_sweep": B_dec_sweep, "B_prefill": B_prefill, "S_dec": S_dec, "S_prefill_sweep": S_prefill_sweep, "D": mdl.D, 
             "num_kv_heads": mdl.N, "H": mdl.H, "F": mdl.F, "prefill_fn": prefill_fn.__name__, 
             "exp": f"decode_with_prefill_contention_{prefill_fn.__name__}"}
 

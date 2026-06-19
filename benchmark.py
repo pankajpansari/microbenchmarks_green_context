@@ -70,7 +70,7 @@ def measure_decode_isolated(mdl, B):
 
   itl = start.elapsed_time(end) / NUM_ITERS
 
-  no_contention_results.append({"Batch": B, "Active_SMs": num_sms, "Elapsed_time_ms": round(itl, 3)})
+  no_contention_results.append({"Batch": B, "Active_SMs": num_sms, "ITL_ms": round(itl, 3)})
 
 
   # Sweep over partition configs. Create green context + associated stream for each 
@@ -105,7 +105,7 @@ def measure_decode_isolated(mdl, B):
 
       itl = start.elapsed_time(end) / NUM_ITERS
 
-      no_contention_results.append({"Batch": B, "Active_SMs": active_sms, "Elapsed_time_ms": round(itl, 3)})
+      no_contention_results.append({"Batch": B, "Active_SMs": active_sms, "ITL_ms": round(itl, 3)})
 
   return no_contention_results
 
@@ -234,7 +234,7 @@ def measure_decode_under_prefill_contention(mdl, prefill_fn, B_dec, B_prefill, S
 
     itl = elapsedTime1 / NUM_ITERS
 
-    contention_decode_results.append({"Batch": B_dec, "Active_SMs": active_sms, "ITL_ms": round(itl, 3)})
+    contention_decode_results.append({"S_prefill": S_prefill, "Batch": B_dec, "Active_SMs": active_sms, "ITL_ms": round(itl, 3)})
 
   return contention_decode_results
 
