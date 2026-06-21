@@ -107,10 +107,10 @@ def measure_decode_isolated(mdl, B):
 
 def main():
   print(f"Profiling decode only in green context")
-  mdl = model.Model(sys.argv[1], sys.argv[2])
+  mdl = model.Model(int(sys.argv[1]), int(sys.argv[2]))
 
   # Decode with no prefill contention; varying batch size, partition configs 
-  measure_decode_isolated(mdl, sys.argv[3])
+  measure_decode_isolated(mdl, int(sys.argv[3]))
   print(f"Completed profiling")
 
 if __name__ == "__main__":
