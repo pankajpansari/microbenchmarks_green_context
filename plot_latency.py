@@ -4,6 +4,8 @@ import argparse
 from matplotlib.lines import Line2D
 import os
 import sys
+import glob
+import re
 
 def plot_decode_itl(csv_filename):
 
@@ -76,7 +78,7 @@ def plot_decode_vs_prefill_itl_delta(csv_filename1, csv_filename2):
   plt.savefig(target_filename)
   plt.close()
 
-def plot_decode_vs_prefill_itl(csv_filename1, csv_filename2, batches):
+def plot_decode_vs_prefill_itl(csv_filename1, csv_filename2, batches = [256, 512]):
   # Overlay ITL time (ms, per-layer) for no-contention decode and decode with prefill contention (varying prefill sizes)
   # csv_filename1: no contention decode info; csv_filename2: decode with (serial or batched) prefills
   df_isol = pd.read_csv(csv_filename1, comment = '#')
@@ -126,7 +128,39 @@ def plot_decode_vs_prefill_itl(csv_filename1, csv_filename2, batches):
   plt.savefig(target_filename)
   plt.close()
 
+def plot_all_decode_vs_prefill_itl(subfolder, batches=[256, 512]):
+  # Read csvs from data/<subfolder>, discover d values from filenames, and for each d
+  # call plot_decode_vs_prefill_itl once for serial and once for batched prefills.
+  # Filename convention:
+  #   decode_only_no_contention__d<D>__...csv
+  #   decode_with_prefill_contention_do_serial_prefill__d<D>__...csv
+  #   decode_with_prefill_contention_do_batched_prefill__d<D>__...csv
+  data_dir = os.path.join('data', subfolder)
+
+  def find_csv(pattern, d):
+    matches = [f for f in glob.glob(os.path.join(data_dir, pattern))
+                if not f.endswith('.meta.json')]
+    matches = [f for f in matches if re.search(rf'__d{d}__', os.path.basename(f))]
+    assert len(matches) == 1, f'Expected exactly 1 match for {pattern} (d={d}), got {matches}'
+    return matches[0]
+
+  # Pick up the distinct d values from the no-contention csv filenames
+  no_contention_files = [f for f in glob.glob(os.path.join(data_dir, 'decode_only_no_contention__*.csv'))
+                          if not f.endswith('.meta.json')]
+  d_values = sorted({int(re.search(r'__d(\d+)__', os.path.basename(f)).group(1))
+                      for f in no_contention_files})
+
+  for d in d_values:
+    no_contention = find_csv('decode_only_no_contention__*.csv', d)
+    serial = find_csv('decode_with_prefill_contention_do_serial_prefill__*.csv', d)
+    batched = find_csv('decode_with_prefill_contention_do_batched_prefill__*.csv', d)
+
+    plot_decode_vs_prefill_itl(no_contention, serial, batches=list(batches))
+    plot_decode_vs_prefill_itl(no_contention, batched, batches=list(batches))
+
 def main():
+  plot_all_decode_vs_prefill_itl('results_runpod_june21')
+  return
   if (len(sys.argv) == 2):
     plot_decode_itl(sys.argv[1])
   elif (len(sys.argv) == 3):
