@@ -105,7 +105,7 @@ def measure_decode_isolated(mdl, B):
 
     target_stream.synchronize()
 
-def measure_prefill_isolated(mdl, prefill_fn, S_prefill, B_prefill):
+def measure_prefill_isolated(mdl, prefill_fn, S_prefill, B_prefill, prefill_sms):
   # Setting: Prefill using one green context; remaining SMs outside context idle 
 
   activation = torch.randn((B_prefill, S_prefill, mdl.D), dtype = torch.float16, device = "cuda")
@@ -121,39 +121,35 @@ def measure_prefill_isolated(mdl, prefill_fn, S_prefill, B_prefill):
   device_props = torch.cuda.get_device_properties(0)
   num_sms = device_props.multi_processor_count
 
-  granularity = 8
-
   NUM_WARMUPS = 1
-  NUM_ITERS = 2 
+  NUM_ITERS = 1 
 
-  # Without any partition - prefill has all SMs
-  # Warmup: launch some prefill kernels
-  with torch.inference_mode():
-    for _ in range(NUM_WARMUPS):
-          if prefill_fn.__name__ ==  "do_batched_prefill":
-            _ = prefill_fn(activation, prefill_wrapper)
-          else:
-            _ = prefill_fn(activation)
+  if prefill_sms == num_sms:
+    # Without any partition - prefill has all SMs
+    # Warmup: launch some prefill kernels
+    with torch.inference_mode():
+      for _ in range(NUM_WARMUPS):
+            if prefill_fn.__name__ ==  "do_batched_prefill":
+              _ = prefill_fn(activation, prefill_wrapper)
+            else:
+              _ = prefill_fn(activation)
 
-  torch.cuda.synchronize()
+    torch.cuda.synchronize()
 
-  torch.cuda.nvtx.range_push(f"prefill-sms-{num_sms}")
-  # Actual prefill runs for timing
-  with torch.inference_mode():
-    for _ in range(NUM_ITERS):
-      if prefill_fn.__name__ ==  "do_batched_prefill":
-        _ = prefill_fn(activation, prefill_wrapper)
-      else:
-        _ = prefill_fn(activation)
-  torch.cuda.nvtx.range_pop()
+    torch.cuda.nvtx.range_push(f"prefill-sms-{prefill_sms}")
+    # Actual prefill runs for timing
+    with torch.inference_mode():
+      for _ in range(NUM_ITERS):
+        if prefill_fn.__name__ ==  "do_batched_prefill":
+          _ = prefill_fn(activation, prefill_wrapper)
+        else:
+          _ = prefill_fn(activation)
+    torch.cuda.nvtx.range_pop()
 
-  torch.cuda.synchronize()
+    torch.cuda.synchronize()
 
-  # Sweep over partition configs. Create green context + associated stream for each 
-  for i in range(1, num_sms // granularity):
-
-    active_sms = num_sms - i*granularity
-    streams, resources = get_green_ctx(active_sms) 
+  else:
+    streams, resources = get_green_ctx(prefill_sms) 
     target_stream = streams[0]
     with torch.cuda.stream(target_stream):
 
@@ -167,7 +163,7 @@ def measure_prefill_isolated(mdl, prefill_fn, S_prefill, B_prefill):
 
       target_stream.synchronize()
 
-      torch.cuda.nvtx.range_push(f"prefill-sms-{active_sms}")
+      torch.cuda.nvtx.range_push(f"prefill-sms-{prefill_sms}")
       # Actual prefill runs for timing
       with torch.inference_mode():
         for _ in range(NUM_ITERS):
@@ -187,6 +183,7 @@ def main():
   p.add_argument("--prefill-fn", choices=["serial", "batched"], required=True)
   p.add_argument("--batch", type=int, required=True, help="prefill batch size B")
   p.add_argument("-S", "--seq-len", type=int, required=True, help="prefill sequence length")
+  p.add_argument("--prefill-sms", type=int, required=True, help="Number of SMs in prefill green context")
   args = p.parse_args()
 
   if args.prefill_fn == "serial" and args.batch != 1:
@@ -198,7 +195,7 @@ def main():
 
   mdl = model.Model(args.dim, args.heads)
   prefill_fn = mdl.do_serial_prefill if args.prefill_fn == "serial" else mdl.do_batched_prefill
-  measure_prefill_isolated(mdl, prefill_fn, args.seq_len, args.batch)
+  measure_prefill_isolated(mdl, prefill_fn, args.seq_len, args.batch, args.prefill_sms)
 
   print("Completed profiling")
 
