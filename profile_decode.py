@@ -38,10 +38,9 @@ def measure_decode_all_sms(mdl, B, S_dec):
   torch.cuda.synchronize()
 
   # Actual decode runs for timing
-  torch.cuda.nvtx.range_push("decode-only")
+  torch.cuda.nvtx.range_push("decode-all-sms")
   with torch.inference_mode():
-    for _ in range(NUM_ITERS):
-      _ = mdl.do_batched_decode(activation, paged_kv, decode_wrapper)
+    _ = mdl.do_batched_decode(activation, paged_kv, decode_wrapper)
   torch.cuda.nvtx.range_pop()
 
   torch.cuda.synchronize()
@@ -58,3 +57,6 @@ def main():
   measure_decode_all_sms(mdl, args.batch, args.seq_len)
 
   print("Completed profiling")
+
+if __name__ == "__main__":
+  main()
