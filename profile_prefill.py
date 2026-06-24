@@ -84,26 +84,53 @@ def measure_prefill_isolated(mdl, prefill_fn, S_prefill, B_prefill, prefill_sms)
 
       target_stream.synchronize()
 
+def measure_serial_prefill_all_sms(mdl, S_prefill):
+  # Setting: Prefill using all SMs 
+
+  activation = torch.randn((1, S_prefill, mdl.D), dtype = torch.float16, device = "cuda")
+
+  device_props = torch.cuda.get_device_properties(0)
+  num_sms = device_props.multi_processor_count
+
+  NUM_WARMUPS = 1
+  NUM_ITERS = 1 
+
+  # Warmup: launch some prefill kernels
+  with torch.inference_mode():
+    for _ in range(NUM_WARMUPS):
+      _ = mdl.do_serial_prefill(activation)
+
+  torch.cuda.synchronize()
+
+  torch.cuda.nvtx.range_push(f"prefill-all-sms")
+  # Actual prefill runs for timing
+  with torch.inference_mode():
+    _ = mdl.do_serial_prefill(activation)
+  torch.cuda.nvtx.range_pop()
+
+  torch.cuda.synchronize()
+
 def main():
   p = argparse.ArgumentParser()
   p.add_argument("-D", "--dim", type=int, required=True, help="model hidden dim D")
   p.add_argument("-N", "--heads", type=int, required=True, help="num attention heads N")
-  p.add_argument("--prefill-fn", choices=["serial", "batched"], required=True)
-  p.add_argument("--batch", type=int, required=True, help="prefill batch size B")
   p.add_argument("-S", "--seq-len", type=int, required=True, help="prefill sequence length")
-  p.add_argument("--prefill-sms", type=int, required=True, help="Number of SMs in prefill green context")
+#  p.add_argument("--prefill-fn", choices=["serial", "batched"], required=True)
+#  p.add_argument("--batch", type=int, required=True, help="prefill batch size B")
+#  p.add_argument("--prefill-sms", type=int, required=True, help="Number of SMs in prefill green context")
   args = p.parse_args()
-
-  if args.prefill_fn == "serial" and args.batch != 1:
-    p.error("serial prefill requires --batch 1")
-
-  print(f"Profiling prefill only in green context: "
-        f"fn={args.prefill_fn} D={args.dim} N={args.heads} "
-        f"B={args.batch} S={args.seq_len}")
+#
+#  if args.prefill_fn == "serial" and args.batch != 1:
+#    p.error("serial prefill requires --batch 1")
+#
+#  print(f"Profiling prefill only in green context: "
+#        f"fn={args.prefill_fn} D={args.dim} N={args.heads} "
+#        f"B={args.batch} S={args.seq_len}")
 
   mdl = model.Model(args.dim, args.heads)
-  prefill_fn = mdl.do_serial_prefill if args.prefill_fn == "serial" else mdl.do_batched_prefill
-  measure_prefill_isolated(mdl, prefill_fn, args.seq_len, args.batch, args.prefill_sms)
+#  prefill_fn = mdl.do_serial_prefill if args.prefill_fn == "serial" else mdl.do_batched_prefill
+#  measure_prefill_isolated(mdl, prefill_fn, args.seq_len, args.batch, args.prefill_sms)
+  measure_serial_prefill_all_sms(mdl, args.seq_len)
 
   print("Completed profiling")
 
