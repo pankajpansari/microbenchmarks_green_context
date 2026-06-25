@@ -1,11 +1,61 @@
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
 import argparse
 from matplotlib.lines import Line2D
 import os
 import sys
 import glob
 import re
+
+from parse_ncu import parse_ncu_csv
+
+
+def plot_kernel_bw_timeline(csv_filename):
+  """Marimekko-style timeline of an ncu profile.
+
+  Lays the kernels out left-to-right in execution order as a row of blocks:
+  each block's width is proportional to the kernel's duration (us) and its
+  height to the achieved HBM bandwidth (% of peak). So the x-axis is a real
+  time axis (cumulative kernel duration) and tall-vs-short shows how well each
+  kernel saturates memory bandwidth. Blocks are coloured by kernel label.
+  """
+  df = parse_ncu_csv(csv_filename)
+  df = df[df['duration_us'].notna()].reset_index(drop=True)
+  if df.empty:
+    raise ValueError(f"{csv_filename}: no kernels with a duration metric to plot.")
+  df['bw_pct'] = df['bw_pct'].fillna(0.0)
+
+  # Left edge of each block = cumulative duration of everything before it.
+  lefts = df['duration_us'].cumsum().shift(fill_value=0.0)
+
+  # One colour per distinct kernel label (stable order of first appearance).
+  labels = list(dict.fromkeys(df['kernel']))
+  cmap = plt.get_cmap('tab10')
+  color_map = {lab: cmap(i % 10) for i, lab in enumerate(labels)}
+  colors = df['kernel'].map(color_map)
+
+  fig, ax = plt.subplots(figsize=(max(8, len(df) * 0.9), 5))
+  ax.bar(lefts, df['bw_pct'], width=df['duration_us'], align='edge',
+         color=colors, edgecolor='white', linewidth=0.8)
+
+  total = df['duration_us'].sum()
+  ax.set_xlim(0, total)
+  ax.set_ylim(0, 100)
+  ax.set_xlabel('Cumulative kernel duration (us)')
+  ax.set_ylabel('Achieved HBM bandwidth (% of peak)')
+  ax.set_title(os.path.basename(csv_filename) + f'\ntotal {total:.1f} us over {len(df)} kernels')
+
+  handles = [Patch(color=color_map[lab], label=lab) for lab in labels]
+  ax.legend(handles=handles, title='Kernel', loc='upper left',
+            bbox_to_anchor=(1.0, 1.0), fontsize=8)
+
+  target_filename = os.path.join('plots', os.path.relpath(csv_filename, 'data'))
+  target_filename = target_filename.replace('.csv', '_bw_timeline.png')
+  os.makedirs(os.path.dirname(target_filename), exist_ok=True)
+  fig.savefig(target_filename, bbox_inches='tight', dpi=150)
+  plt.close(fig)
+  return target_filename
 
 def plot_decode_itl(csv_filename):
 
@@ -159,7 +209,14 @@ def plot_all_decode_vs_prefill_itl(subfolder, batches=[256, 512]):
     plot_decode_vs_prefill_itl(no_contention, batched, batches=list(batches))
 
 def main():
-  plot_all_decode_vs_prefill_itl('results_runpod_june21')
+  files = sorted(glob.glob('data/results_jarvis_june25/prefill_all_sms/*.csv'))
+
+  for f in files:
+      print(f'\n===== {f} =====')
+      df = parse_ncu_csv(f)
+      print(df[['ID', 'kernel', 'bw_pct', 'duration_us']].to_string(index=False))
+      plot_kernel_bw_timeline(f)            # writes plots/.../<name>_bw_timeline.png
+#  plot_all_decode_vs_prefill_itl('results_runpod_june21')
   return
   if (len(sys.argv) == 2):
     plot_decode_itl(sys.argv[1])
