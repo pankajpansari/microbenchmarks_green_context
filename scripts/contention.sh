@@ -80,7 +80,7 @@ MANIFEST="${OUT_DIR}/${OUT_PREFIX}_manifest_$(date +%Y%m%d-%H%M%S).txt"
   echo "git:        $GIT_REV"
   echo "invocation: $0 ${ORIG_ARGS[*]}"
   echo "grid:       D={$D_SWEEP} N=$N decode-batch={$DEC_BATCH_SWEEP} S-prefill={$S_PREFILL_SWEEP} S-decode=$S_DECODE sms={$SM_SWEEP}"
-  echo "ncu:        --replay-mode range --nvtx-include prefill/,decode/,prefill-decode/"
+  echo "ncu:        --replay-mode application --nvtx-include prefill/,decode/,prefill-decode/"
   echo "metrics:    $METRICS"
   echo
 } > "$MANIFEST"
@@ -111,7 +111,7 @@ for D in $D_SWEEP; do
       echo
     } >> "$MANIFEST"
 
-    sudo_env ncu --replay-mode range \
+    sudo_env ncu --replay-mode application \
       --nvtx --nvtx-include "prefill/" --nvtx-include "decode/" --nvtx-include "prefill-decode/" \
       --metrics "$METRICS" \
       --csv --log-file "$CSV" \
